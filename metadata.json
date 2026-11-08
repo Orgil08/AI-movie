@@ -1,0 +1,8 @@
+{
+  "name": "AI MOVIE — Wire.mn & QPay Төлбөрийн Систем",
+  "description": "Netflix загварын AI MOVIE платформын Wire.mn болон QPay албан ёсны төлбөрийн гарцын бүрэн интеграци, гишүүнчлэл, хамгаалагдсан видео үзвэр.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
