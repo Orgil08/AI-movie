@@ -3,10 +3,15 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { Storage, connectDB } from './src/db/storage.js';
 import { defaultWireService, WireService } from './src/services/wire.service.js';
 import { SUBSCRIPTION_PLANS, isValidPlanId, getPlanById } from './src/config/subscription-plans.js';
+import { BANK_TRANSFER_DETAILS } from './src/config/bank-details.js';
 import { MOVIES, getMovieById } from './src/data/movies.js';
+import { hashPassword, verifyPassword } from './src/utils/crypto.js';
+import { getPageMetadata } from './src/i18n/seo.js';
+import { getLocaleFromPath } from './src/i18n/routing.js';
 
 dotenv.config();
 
@@ -17,13 +22,21 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// User resolution helper (supports cookie, auth header, or default demo user)
-function getAuthenticatedUser(req: Request): { id: string; name: string; email: string } {
+// User resolution helper (supports cookie, auth header, or registered users in database)
+async function getAuthenticatedUser(req: Request): Promise<{ id: string; name: string; email: string } | null> {
   const headerUserId = req.headers['x-user-id'] as string;
   const cookieMatch = req.headers.cookie?.match(/ai_movie_uid=([^;]+)/);
   const cookieUserId = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
 
-  const userId = headerUserId || cookieUserId || 'user_batbayar';
+  const userId = headerUserId || cookieUserId;
+  if (!userId) {
+    return null;
+  }
+
+  const dbUser = await Storage.getUserById(userId);
+  if (dbUser) {
+    return { id: dbUser.id || userId, name: dbUser.name, email: dbUser.email };
+  }
 
   const userDirectory: Record<string, { id: string; name: string; email: string }> = {
     user_batbayar: { id: 'user_batbayar', name: 'Батбаяр', email: 'batbayar@aimovie.mn' },
@@ -31,7 +44,11 @@ function getAuthenticatedUser(req: Request): { id: string; name: string; email: 
     user_temuulen: { id: 'user_temuulen', name: 'Тэмүүлэн', email: 'temuulen@aimovie.mn' }
   };
 
-  return userDirectory[userId] || { id: userId, name: userId, email: `${userId}@aimovie.mn` };
+  if (userDirectory[userId]) {
+    return userDirectory[userId];
+  }
+
+  return { id: userId, name: userId, email: `${userId}@aimovie.mn` };
 }
 
 // Generate base app URL
@@ -58,10 +75,20 @@ app.use(
 app.use(express.json());
 
 // -------------------------------------------------------------
-// 2. Authentication Context Endpoint
+// 2. Authentication Endpoints (Sign In, Sign Up, Sign Out, Me)
 // -------------------------------------------------------------
+
+// Context Endpoint: returns current user and active subscription
 app.get('/api/auth/me', async (req: Request, res: Response) => {
-  const user = getAuthenticatedUser(req);
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.json({
+      user: null,
+      subscription: null,
+      wireConfigured: defaultWireService.isConfigured()
+    });
+  }
+
   const subscription = await Storage.getActiveSubscription(user.id);
   const plan = subscription ? getPlanById(subscription.planId) : null;
 
@@ -85,6 +112,112 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
   });
 });
 
+// User Registration: Sign Up with name, email, password
+app.post('/api/auth/register', async (req: Request, res: Response) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (!name || typeof name !== 'string' || name.trim().length < 2) {
+      return res.status(400).json({
+        error: 'INVALID_NAME',
+        message: 'Нэр хамгийн багадаа 2 тэмдэгт байх ёстой.'
+      });
+    }
+
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({
+        error: 'INVALID_EMAIL',
+        message: 'Имэйл хаягаа зөв оруулна уу.'
+      });
+    }
+
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({
+        error: 'INVALID_PASSWORD',
+        message: 'Нууц үг хамгийн багадаа 6 тэмдэгт байх ёстой.'
+      });
+    }
+
+    const existingUser = await Storage.getUserByEmail(email);
+    if (existingUser) {
+      return res.status(400).json({
+        error: 'EMAIL_ALREADY_EXISTS',
+        message: 'Энэ имэйл хаяг бүртгэгдсэн байна. Нэвтэрч орно уу.'
+      });
+    }
+
+    const passwordHash = hashPassword(password);
+    const newUser = await Storage.createUser({
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      passwordHash,
+      role: 'member'
+    });
+
+    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(newUser.id!)}; Path=/; HttpOnly; SameSite=Lax`);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Амжилттай бүртгэгдлээ.',
+      user: {
+        id: newUser.id,
+        name: newUser.name,
+        email: newUser.email
+      }
+    });
+  } catch (err: any) {
+    console.error('[Auth/Register] Error:', err);
+    return res.status(500).json({ error: 'SERVER_ERROR', message: 'Бүртгүүлэхэд алдаа гарлаа.' });
+  }
+});
+
+// User Login: Sign In with email, password
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'MISSING_FIELDS',
+        message: 'Имэйл болон нууц үгээ оруулна уу.'
+      });
+    }
+
+    const user = await Storage.getUserByEmail(email);
+    if (!user || !verifyPassword(password, user.passwordHash)) {
+      return res.status(401).json({
+        error: 'INVALID_CREDENTIALS',
+        message: 'Имэйл эсвэл нууц үг буруу байна.'
+      });
+    }
+
+    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(user.id!)}; Path=/; HttpOnly; SameSite=Lax`);
+
+    const subscription = await Storage.getActiveSubscription(user.id!);
+
+    return res.json({
+      success: true,
+      message: 'Амжилттай нэвтэрлээ.',
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email
+      },
+      subscription
+    });
+  } catch (err: any) {
+    console.error('[Auth/Login] Error:', err);
+    return res.status(500).json({ error: 'SERVER_ERROR', message: 'Нэвтрэхэд алдаа гарлаа.' });
+  }
+});
+
+// User Sign Out: Clears session cookie
+app.post('/api/auth/logout', (_req: Request, res: Response) => {
+  res.setHeader('Set-Cookie', 'ai_movie_uid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  return res.json({ success: true, message: 'Амжилттай гарлаа.' });
+});
+
+// Quick Switch User (demo test helper)
 app.post('/api/auth/switch-user', (req: Request, res: Response) => {
   const { userId } = req.body;
   if (!userId) {
@@ -95,11 +228,16 @@ app.post('/api/auth/switch-user', (req: Request, res: Response) => {
   res.json({ success: true, userId });
 });
 
+
 // -------------------------------------------------------------
 // 3. Subscription Info
 // -------------------------------------------------------------
 app.get('/api/subscription', async (req: Request, res: Response) => {
-  const user = getAuthenticatedUser(req);
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.json({ active: false, subscription: null });
+  }
+
   const subscription = await Storage.getActiveSubscription(user.id);
   const plan = subscription ? getPlanById(subscription.planId) : null;
 
@@ -128,13 +266,27 @@ app.get('/api/subscription', async (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
+// Bank Transfer Details API
+// GET /api/bank-details
+// -------------------------------------------------------------
+app.get('/api/bank-details', (req: Request, res: Response) => {
+  res.json({ bankDetails: BANK_TRANSFER_DETAILS });
+});
+
+// -------------------------------------------------------------
 // 4. Payment Creation (Step 1-4)
 // POST /api/payments/create
 // -------------------------------------------------------------
 app.post('/api/payments/create', async (req: Request, res: Response) => {
   try {
-    const user = getAuthenticatedUser(req);
-    const { planId } = req.body;
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({
+        error: 'AUTH_REQUIRED',
+        message: 'Төлбөр төлөхийн тулд эхлээд системд нэвтэрнэ үү.'
+      });
+    }
+    const { planId, paymentMethod = 'wire_qpay' } = req.body;
 
     if (!planId || !isValidPlanId(planId)) {
       return res.status(400).json({
@@ -161,7 +313,8 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
     let wireCheckoutSessionId = `cs_aimov_${orderNumber}`;
     let checkoutUrl = `${baseUrl}/checkout/${orderNumber}`;
 
-    if (defaultWireService.isConfigured()) {
+    // Only invoke Wire API for wire_qpay payments
+    if (paymentMethod === 'wire_qpay' && defaultWireService.isConfigured()) {
       // 1. Create PaymentIntent on Wire API
       const paymentIntent = await defaultWireService.createPaymentIntent({
         amount: serverAmount,
@@ -187,6 +340,8 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
 
       wireCheckoutSessionId = checkoutSession.id;
       checkoutUrl = checkoutSession.url;
+    } else if (paymentMethod === 'bank_transfer') {
+      wirePaymentIntentId = `bank_transfer_${orderNumber}`;
     }
 
     // Record internal pending payment
@@ -194,8 +349,9 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
       userId: user.id,
       orderNumber,
       planId: plan.id,
+      paymentMethod,
       wirePaymentIntentId,
-      wireCheckoutSessionId,
+      wireCheckoutSessionId: paymentMethod === 'wire_qpay' ? wireCheckoutSessionId : undefined,
       amount: serverAmount,
       currency,
       status: 'PENDING',
@@ -205,11 +361,13 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
     res.json({
       success: true,
       orderNumber: payment.orderNumber,
+      paymentMethod,
       checkoutUrl,
       paymentIntentId: wirePaymentIntentId,
       checkoutSessionId: wireCheckoutSessionId,
       amount: serverAmount,
       currency,
+      bankTransferDetails: BANK_TRANSFER_DETAILS,
       plan: {
         id: plan.id,
         nameMn: plan.nameMn,
@@ -226,11 +384,76 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
+// Bank Transfer Confirmation
+// POST /api/payments/bank-transfer/confirm
+// -------------------------------------------------------------
+app.post('/api/payments/bank-transfer/confirm', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Нэвтэрч орно уу.' });
+    }
+    const { orderNumber, senderName, transferRef, phone } = req.body;
+
+    if (!orderNumber) {
+      return res.status(400).json({ error: 'orderNumber is required' });
+    }
+
+    const payment = await Storage.getPaymentByOrderNumber(orderNumber);
+    if (!payment) {
+      return res.status(404).json({ error: 'ORDER_NOT_FOUND', message: 'Захиалга олдсонгүй.' });
+    }
+
+    if (payment.userId !== user.id) {
+      return res.status(403).json({ error: 'UNAUTHORIZED_ACCESS' });
+    }
+
+    if (payment.status === 'PAID') {
+      return res.json({ success: true, message: 'Захиалга аль хэдийн баталгаажсан байна.', orderNumber });
+    }
+
+    const refString = transferRef || `TXN-${Date.now().toString().slice(-6)}`;
+    const sender = senderName ? `${senderName}${phone ? ` (${phone})` : ''}` : user.name;
+
+    // Update payment record to PAID
+    await Storage.updatePaymentStatus(payment.orderNumber, 'PAID', {
+      paidAt: new Date(),
+      bankSenderName: sender,
+      bankTransferRef: refString
+    });
+
+    // Activate subscription in database
+    await Storage.activateSubscription({
+      userId: payment.userId,
+      planId: payment.planId,
+      paymentId: payment.orderNumber,
+      durationDays: 30
+    });
+
+    console.log(`[BankTransfer] Order ${payment.orderNumber} confirmed for user ${payment.userId}. Plan ${payment.planId} activated.`);
+
+    res.json({
+      success: true,
+      message: 'Дансны шилжүүлэг амжилттай баталгаажиж, гишүүнчлэл идэвхжлээ.',
+      orderNumber: payment.orderNumber,
+      planId: payment.planId,
+      status: 'PAID'
+    });
+  } catch (error: any) {
+    console.error('[BankTransfer/Confirm] Error:', error);
+    res.status(500).json({ error: 'SERVER_ERROR', message: error?.message || 'Баталгаажуулахад алдаа гарлаа.' });
+  }
+});
+
+// -------------------------------------------------------------
 // 5. Payment History (MUST be before :orderId route)
 // GET /api/payments/history
 // -------------------------------------------------------------
 app.get('/api/payments/history', async (req: Request, res: Response) => {
-  const user = getAuthenticatedUser(req);
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.json({ payments: [] });
+  }
   const payments = await Storage.getPaymentsByUserId(user.id);
 
   const formatted = payments.map((p) => {
@@ -239,10 +462,13 @@ app.get('/api/payments/history', async (req: Request, res: Response) => {
       orderNumber: p.orderNumber,
       planId: p.planId,
       planName: plan?.nameMn || p.planId,
+      paymentMethod: p.paymentMethod || 'wire_qpay',
       amount: p.amount,
       currency: p.currency,
       status: p.status,
       wirePaymentIntentId: p.wirePaymentIntentId,
+      bankSenderName: p.bankSenderName,
+      bankTransferRef: p.bankTransferRef,
       createdAt: p.createdAt,
       paidAt: p.paidAt
     };
@@ -257,7 +483,7 @@ app.get('/api/payments/history', async (req: Request, res: Response) => {
 // -------------------------------------------------------------
 app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
   try {
-    const user = getAuthenticatedUser(req);
+    const user = await getAuthenticatedUser(req);
     const { orderId } = req.params;
 
     const payment = await Storage.getPaymentByOrderNumber(orderId);
@@ -268,16 +494,22 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
       });
     }
 
-    // Verify ownership
-    if (payment.userId !== user.id) {
+    // Verify ownership if user is logged in
+    if (user && payment.userId && payment.userId !== user.id) {
       return res.status(403).json({
         error: 'UNAUTHORIZED_ORDER_ACCESS',
         message: 'Энэ захиалгын мэдээлэлд хандах эрхгүй байна.'
       });
     }
 
-    // If PENDING and Wire is configured, we can independently query Wire to check for updates
-    if (payment.status === 'PENDING' && defaultWireService.isConfigured() && payment.wirePaymentIntentId) {
+    // If PENDING and Wire is configured, we can independently query Wire to check for updates (only for wire_qpay)
+    if (
+      payment.status === 'PENDING' &&
+      payment.paymentMethod === 'wire_qpay' &&
+      defaultWireService.isConfigured() &&
+      payment.wirePaymentIntentId &&
+      !payment.wirePaymentIntentId.startsWith('bank_')
+    ) {
       try {
         const wirePi = await defaultWireService.getPaymentIntent(payment.wirePaymentIntentId);
         if (wirePi.status === 'succeeded') {
@@ -310,11 +542,15 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
     res.json({
       orderNumber: payment.orderNumber,
       status: payment.status,
+      paymentMethod: payment.paymentMethod || 'wire_qpay',
       amount: payment.amount,
       currency: payment.currency,
       planId: payment.planId,
       planName: plan?.nameMn || payment.planId,
       checkoutUrl: payment.checkoutUrl,
+      bankSenderName: payment.bankSenderName,
+      bankTransferRef: payment.bankTransferRef,
+      bankTransferDetails: BANK_TRANSFER_DETAILS,
       createdAt: payment.createdAt,
       paidAt: payment.paidAt
     });
@@ -504,10 +740,16 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
     return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
   }
 
-  const user = getAuthenticatedUser(req);
+  const user = await getAuthenticatedUser(req);
 
   // If movie is premium, enforce active subscription check
   if (movie.isPremium) {
+    if (!user) {
+      return res.status(401).json({
+        error: 'AUTH_REQUIRED',
+        message: 'Энэ киног үзэхийн тулд эхлээд системд нэвтэрнэ үү.'
+      });
+    }
     const activeSub = await Storage.getActiveSubscription(user.id);
     if (!activeSub) {
       return res.status(403).json({
@@ -519,9 +761,10 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
   }
 
   // Create signed token with 2 hour expiration
+  const userId = user ? user.id : 'guest';
   const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
   const tokenSecret = process.env.AUTH_SECRET || 'ai_movie_secret_stream_key';
-  const tokenPayload = `${movie.id}:${user.id}:${expiresAt}`;
+  const tokenPayload = `${movie.id}:${userId}:${expiresAt}`;
   const signedToken = crypto.createHmac('sha256', tokenSecret).update(tokenPayload).digest('hex');
 
   res.json({
@@ -634,24 +877,98 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
 });
 
 // -------------------------------------------------------------
-// 10. Vite Dev Middleware / Static Production Assets
+// 10. Dynamic SEO Metadata Injection & Vite Integration
 // -------------------------------------------------------------
+function injectSeoIntoHtml(htmlTemplate: string, req: Request): string {
+  const url = req.originalUrl || req.url;
+  const pathLocale = getLocaleFromPath(url);
+  const cookieLocale = req.headers.cookie?.match(/NEXT_LOCALE=([a-z]{2})/)?.[1] ||
+                       req.headers.cookie?.match(/ai_movie_locale=([a-z]{2})/)?.[1];
+  const detectedLocale = pathLocale || (cookieLocale === 'en' ? 'en' : 'mn');
+
+  const baseUrl = getBaseUrl(req);
+  const metadata = getPageMetadata(detectedLocale as any, url, { baseUrl });
+
+  let html = htmlTemplate;
+
+  // Set html lang attribute
+  html = html.replace(/<html(\s+[^>]*)?lang="[^"]*"/i, `<html$1lang="${detectedLocale}"`);
+
+  // Replace <title>
+  html = html.replace(/<title>[\s\S]*?<\/title>/i, `<title>${metadata.title}</title>`);
+
+  // Replace <meta name="description" ...>
+  html = html.replace(
+    /<meta\s+name="description"\s+content="[^"]*"\s*\/?>/i,
+    `<meta name="description" content="${metadata.description}" />`
+  );
+
+  // Replace OpenGraph title & description
+  html = html.replace(
+    /<meta\s+property="og:title"\s+content="[^"]*"\s*\/?>/i,
+    `<meta property="og:title" content="${metadata.ogTitle}" />`
+  );
+  html = html.replace(
+    /<meta\s+property="og:description"\s+content="[^"]*"\s*\/?>/i,
+    `<meta property="og:description" content="${metadata.ogDescription}" />`
+  );
+
+  // Inject or update canonical, twitter, and Schema.org structured data (JSON-LD)
+  const dynamicSeoSnippet = `
+    <!-- Crawl-time Localized SEO & Social Cards -->
+    <link rel="canonical" href="${metadata.canonicalUrl}" />
+    <meta property="og:url" content="${metadata.canonicalUrl}" />
+    <meta name="twitter:title" content="${metadata.ogTitle}" />
+    <meta name="twitter:description" content="${metadata.ogDescription}" />
+    <script type="application/ld+json" id="seo-json-ld">${JSON.stringify(metadata.jsonLd)}</script>
+  `;
+
+  html = html.replace('</head>', `${dynamicSeoSnippet}\n  </head>`);
+
+  return html;
+}
+
 async function startServer() {
   await connectDB();
 
+  let vite: any = null;
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
+    vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: 'spa'
+      appType: 'custom'
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-    });
+    app.use(express.static(path.join(__dirname, 'dist'), { index: false }));
   }
+
+  // Handle all HTML/navigation routes with dynamic localized SEO metadata
+  app.get('*', async (req: Request, res: Response, next: NextFunction) => {
+    const url = req.originalUrl;
+    // Skip API routes or static files with extension
+    if (url.startsWith('/api') || path.extname(url)) {
+      return next();
+    }
+
+    try {
+      let template: string;
+      if (!isProduction && vite) {
+        template = fs.readFileSync(path.resolve(__dirname, 'index.html'), 'utf-8');
+        template = await vite.transformIndexHtml(url, template);
+      } else {
+        template = fs.readFileSync(path.resolve(__dirname, 'dist', 'index.html'), 'utf-8');
+      }
+
+      const localizedHtml = injectSeoIntoHtml(template, req);
+      res.status(200).set({ 'Content-Type': 'text/html' }).end(localizedHtml);
+    } catch (e: any) {
+      if (!isProduction && vite) {
+        vite.ssrFixStacktrace(e);
+      }
+      next(e);
+    }
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[AI MOVIE] Server listening on http://0.0.0.0:${PORT}`);

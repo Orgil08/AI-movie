@@ -1,5 +1,6 @@
 import React from 'react';
-import { X, ExternalLink, ShieldCheck, Key, Webhook, CheckCircle2, Code2, QrCode } from 'lucide-react';
+import { X, ExternalLink, ShieldCheck, Key, CheckCircle2, QrCode } from 'lucide-react';
+import { useTranslations, useLocale } from '../i18n/I18nContext.js';
 
 interface WireDocsGuideModalProps {
   isOpen: boolean;
@@ -7,6 +8,10 @@ interface WireDocsGuideModalProps {
 }
 
 export const WireDocsGuideModal: React.FC<WireDocsGuideModalProps> = ({ isOpen, onClose }) => {
+  const { locale } = useLocale();
+  const tDocs = useTranslations('WireDocs');
+  const tCommon = useTranslations('Common');
+
   if (!isOpen) return null;
 
   return (
@@ -23,9 +28,9 @@ export const WireDocsGuideModal: React.FC<WireDocsGuideModalProps> = ({ isOpen, 
               <ShieldCheck className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-lg font-bold text-white">Wire.mn & QPay Интеграци ба Тохиргооны Заавар</h2>
+              <h2 className="text-lg font-bold text-white">{tDocs('title')}</h2>
               <p className="text-xs text-neutral-400">
-                Албан ёсны баримт бичиг ба хөгжүүлэлтийн удирдамж
+                {tDocs('subtitle')}
               </p>
             </div>
           </div>
@@ -122,6 +127,25 @@ export const WireDocsGuideModal: React.FC<WireDocsGuideModalProps> = ({ isOpen, 
               </div>
             </div>
           </div>
+
+          {/* Direct Bank Transfer Option */}
+          <div>
+            <h3 className="text-sm font-bold text-white uppercase tracking-wider mb-2 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-emerald-500" />
+              <span>Дансаар шилжүүлэх нэмэлт төлбөрийн систем</span>
+            </h3>
+            <div className="space-y-2 bg-neutral-950 p-4 rounded-xl border border-neutral-800">
+              <p className="text-neutral-300">
+                Хэрэглэгчдэд зориулсан шууд банкны шилжүүлгийн данс:
+              </p>
+              <div className="p-3 bg-neutral-900 rounded-lg border border-neutral-700/80 space-y-1 font-mono text-xs">
+                <div>Банк: <strong className="text-white font-sans">Хаан Банк (Khan Bank)</strong></div>
+                <div>Данс: <strong className="text-amber-400 text-sm">5132104221</strong></div>
+                <div>Эзэмшигч: <strong className="text-white font-sans">Сүхбат Мөнх-Оргил (sukhbat munkh-orgil)</strong></div>
+                <div>Гүйлгээний утга: <span className="text-red-400 font-sans">Захиалгын дугаар (Жишээ: AIMOV-...)</span></div>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Modal Footer */}
@@ -130,7 +154,7 @@ export const WireDocsGuideModal: React.FC<WireDocsGuideModalProps> = ({ isOpen, 
             onClick={onClose}
             className="px-5 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-white font-semibold text-xs transition"
           >
-            Хаах
+            {tDocs('close')}
           </button>
         </div>
       </div>

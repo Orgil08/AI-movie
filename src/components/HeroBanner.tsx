@@ -1,6 +1,7 @@
-import React from 'react';
-import { Play, Info, Sparkles, ShieldCheck, Volume2, VolumeX } from 'lucide-react';
-import { Movie } from '../data/movies.js';
+import React, { useState } from 'react';
+import { Play, Info, Star, ShieldCheck, Film, Volume2, Sparkles } from 'lucide-react';
+import { Movie, getLocalizedMovieText } from '../data/movies.js';
+import { useTranslations, useLocale } from '../i18n/I18nContext.js';
 
 interface HeroBannerProps {
   movie: Movie;
@@ -15,78 +16,102 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
   onSelect,
   hasActiveSubscription
 }) => {
+  const t = useTranslations('HomePage');
+  const { locale } = useLocale();
+
+  const title = getLocalizedMovieText(movie.title, locale, movie.titleMn);
+  const altTitle = locale === 'mn' ? movie.titleEn : movie.titleMn;
+  const synopsis = getLocalizedMovieText(movie.synopsis, locale, movie.descriptionMn);
+  const director = getLocalizedMovieText(movie.director, locale, movie.directorMn);
+  const genre = getLocalizedMovieText(movie.genre, locale, movie.genreMn);
+
   return (
-    <div className="relative w-full h-[70vh] min-h-[500px] max-h-[720px] bg-neutral-950 overflow-hidden select-none">
-      {/* Background Image with Cinematic Overlays */}
+    <div className="relative w-full h-[76vh] min-h-[540px] max-h-[760px] bg-[#0b0f19] overflow-hidden select-none">
+      {/* Background Cinematic Banner Image with Fallback */}
       <img
         src={movie.bannerUrl}
-        alt={movie.titleMn}
-        className="absolute inset-0 w-full h-full object-cover object-center filter brightness-[0.65] contrast-[1.1] scale-105 transition-transform duration-1000 ease-out"
+        alt={title}
+        referrerPolicy="no-referrer"
+        className="absolute inset-0 w-full h-full object-cover object-center filter brightness-[0.6] contrast-[1.12] transition-transform duration-1000 ease-out"
       />
 
-      {/* Cinematic Gradients */}
-      <div className="absolute inset-0 bg-gradient-to-t from-[#141414] via-[#141414]/40 to-transparent" />
-      <div className="absolute inset-0 bg-gradient-to-r from-[#141414] via-[#141414]/60 to-transparent w-full md:w-3/4" />
+      {/* Streamline Midnight & Gold Gradients */}
+      <div className="absolute inset-0 bg-gradient-to-t from-[#0b0f19] via-[#0b0f19]/60 to-transparent" />
+      <div className="absolute inset-0 bg-gradient-to-r from-[#0b0f19] via-[#0b0f19]/80 to-transparent w-full lg:w-2/3" />
+      <div className="absolute top-0 right-0 w-96 h-96 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />
 
       {/* Content Container */}
       <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-full flex flex-col justify-end pb-16 md:pb-24 z-10">
         <div className="max-w-2xl space-y-4">
-          {/* Badge line */}
+          {/* Streamline Tag & Metadata strip */}
           <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
-            <span className="px-2.5 py-0.5 rounded bg-red-600 text-white uppercase tracking-wider flex items-center gap-1 font-bold">
-              <Sparkles className="w-3.5 h-3.5" />
-              AI ЭХ ҮЗВЭР
+            <span className="px-2.5 py-0.5 rounded-md bg-[#e5a93c] text-black font-extrabold tracking-wider uppercase text-[11px] shadow-sm">
+              SODON GOLD
             </span>
-            <span className="px-2 py-0.5 rounded bg-black/60 backdrop-blur-md text-amber-400 border border-amber-500/30">
-              ★ {movie.rating}
+            <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-black/60 backdrop-blur-md text-[#e5a93c] border border-[#e5a93c]/30 font-bold">
+              <Star className="w-3.5 h-3.5 fill-[#e5a93c] text-[#e5a93c]" />
+              <span>{movie.rating}</span>
             </span>
-            <span className="px-2 py-0.5 rounded bg-white/10 backdrop-blur-md text-neutral-300">
+            <span className="px-2 py-0.5 rounded-md bg-white/10 backdrop-blur-md text-slate-300">
               {movie.year}
             </span>
-            <span className="px-2 py-0.5 rounded bg-white/10 backdrop-blur-md text-neutral-300">
+            <span className="px-2 py-0.5 rounded-md bg-white/10 backdrop-blur-md text-slate-300">
               {movie.duration}
             </span>
-            <span className="px-2 py-0.5 rounded bg-neutral-800 text-neutral-200 border border-neutral-700">
+            <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/15 text-slate-200">
               {movie.quality}
             </span>
             {movie.isPremium && (
-              <span className="px-2 py-0.5 rounded bg-gradient-to-r from-amber-500/20 to-red-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1">
-                <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
-                Премиум
+              <span className="px-2.5 py-0.5 rounded-md bg-amber-500/15 text-[#e5a93c] border border-amber-500/30 flex items-center gap-1 font-medium">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>VIP 4K</span>
               </span>
             )}
           </div>
 
           {/* Title */}
-          <h1 className="text-3xl sm:text-5xl md:text-6xl font-black text-white tracking-tight leading-tight drop-shadow-md">
-            {movie.titleMn}
+          <h1 className="text-3xl sm:text-5xl md:text-6xl font-black text-white tracking-tight leading-tight drop-shadow-lg">
+            {title}
           </h1>
 
-          <div className="text-sm font-medium text-neutral-400 italic">
-            {movie.titleEn} • Найруулагч: {movie.directorMn}
+          {/* Subtitle / Genre / Director */}
+          <div className="text-xs sm:text-sm font-medium text-slate-400 flex items-center gap-2 flex-wrap">
+            <span className="text-[#e5a93c]">{genre}</span>
+            <span className="text-slate-600">·</span>
+            <span>{altTitle}</span>
+            <span className="text-slate-600">·</span>
+            <span>{locale === 'en' ? `Directed by ${director}` : `Найруулагч: ${director}`}</span>
           </div>
 
-          {/* Description */}
-          <p className="text-sm sm:text-base text-neutral-300 line-clamp-3 leading-relaxed drop-shadow">
-            {movie.descriptionMn}
+          {/* Synopsis */}
+          <p className="text-sm sm:text-base text-slate-300 line-clamp-3 leading-relaxed drop-shadow max-w-xl">
+            {synopsis}
           </p>
 
           {/* Action Buttons */}
-          <div className="flex flex-wrap items-center gap-3 pt-3">
+          <div className="flex flex-wrap items-center gap-3 pt-2">
             <button
               onClick={() => onPlay(movie)}
-              className="px-6 py-3 rounded-lg bg-white text-black font-bold text-base flex items-center gap-2 hover:bg-neutral-200 transition active:scale-95 shadow-xl cursor-pointer"
+              className="px-6 py-3 rounded-xl bg-gradient-to-r from-[#e5a93c] via-amber-400 to-[#e5a93c] text-black font-extrabold text-sm sm:text-base flex items-center gap-2.5 hover:brightness-110 transition active:scale-95 shadow-xl shadow-amber-900/40 cursor-pointer"
             >
               <Play className="w-5 h-5 fill-black" />
-              <span>{hasActiveSubscription || !movie.isPremium ? 'Шууд Үзэх' : 'Үзэх (Премиум)'}</span>
+              <span>{hasActiveSubscription || !movie.isPremium ? t('watchNow') : `${t('watchNow')} (VIP)`}</span>
             </button>
 
             <button
               onClick={() => onSelect(movie)}
-              className="px-6 py-3 rounded-lg bg-neutral-800/80 backdrop-blur-md text-white font-semibold text-base flex items-center gap-2 hover:bg-neutral-700/80 border border-white/20 transition active:scale-95 cursor-pointer"
+              className="px-5 py-3 rounded-xl bg-white/10 hover:bg-white/15 backdrop-blur-md text-white font-semibold text-sm sm:text-base flex items-center gap-2 border border-white/20 transition active:scale-95 cursor-pointer"
             >
-              <Info className="w-5 h-5" />
-              <span>Дэлгэрэнгүй мэдээлэл</span>
+              <Info className="w-4 h-4 text-[#e5a93c]" />
+              <span>{t('moreInfo')}</span>
+            </button>
+
+            <button
+              onClick={() => onPlay(movie)}
+              className="hidden sm:flex px-4 py-3 rounded-xl bg-black/40 hover:bg-black/60 backdrop-blur-md text-slate-300 hover:text-white text-sm font-medium items-center gap-2 border border-white/10 transition cursor-pointer"
+            >
+              <Film className="w-4 h-4" />
+              <span>{t('trailer')}</span>
             </button>
           </div>
         </div>

@@ -209,3 +209,59 @@ test('Pricing - Subscription configuration has exact official prices in whole MN
   assert.ok(standardPlan);
   assert.equal(standardPlan?.popular, true);
 });
+
+test('BankTransfer - Configuration contains exact account 5132104221 and sukhbat munkh-orgil', async () => {
+  const { BANK_TRANSFER_DETAILS } = await import('../config/bank-details.js');
+  assert.equal(BANK_TRANSFER_DETAILS.accountNumber, '5132104221');
+  assert.equal(BANK_TRANSFER_DETAILS.accountHolder, 'Сүхбат Мөнх-Оргил');
+  assert.equal(BANK_TRANSFER_DETAILS.accountHolderEn, 'sukhbat munkh-orgil');
+  assert.ok(BANK_TRANSFER_DETAILS.bankName.includes('Хаан'));
+});
+
+test('BankTransfer - Payment order and confirmation activates user subscription', async () => {
+  memDb.clear();
+
+  const userId = 'user_bank_test';
+  const orderNumber = 'AIMOV-BANK-001';
+
+  // 1. Create bank transfer order
+  const order = await Storage.createPayment({
+    userId,
+    orderNumber,
+    planId: 'premium',
+    paymentMethod: 'bank_transfer',
+    wirePaymentIntentId: `bank_${orderNumber}`,
+    amount: 19900,
+    currency: 'MNT',
+    status: 'PENDING'
+  });
+
+  assert.equal(order.status, 'PENDING');
+  assert.equal(order.paymentMethod, 'bank_transfer');
+
+  // 2. Confirm bank transfer
+  const updated = await Storage.updatePaymentStatus(orderNumber, 'PAID', {
+    paidAt: new Date(),
+    bankSenderName: 'Сүхбат Мөнх-Оргил',
+    bankTransferRef: 'TXN-998877'
+  });
+
+  assert.equal(updated?.status, 'PAID');
+  assert.equal(updated?.bankSenderName, 'Сүхбат Мөнх-Оргил');
+  assert.equal(updated?.bankTransferRef, 'TXN-998877');
+
+  // 3. Activate subscription
+  const sub = await Storage.activateSubscription({
+    userId,
+    planId: order.planId,
+    paymentId: orderNumber,
+    durationDays: 30
+  });
+
+  assert.equal(sub.status, 'ACTIVE');
+  assert.equal(sub.planId, 'premium');
+
+  const activeSub = await Storage.getActiveSubscription(userId);
+  assert.ok(activeSub);
+  assert.equal(activeSub?.planId, 'premium');
+});
