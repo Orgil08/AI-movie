@@ -37,12 +37,12 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
 
       {/* Streamline Midnight & Gold Gradients */}
       <div className="absolute inset-0 bg-gradient-to-t from-[#0b0f19] via-[#0b0f19]/60 to-transparent" />
-      <div className="absolute inset-0 bg-gradient-to-r from-[#0b0f19] via-[#0b0f19]/80 to-transparent w-full lg:w-2/3" />
+      <div className="absolute inset-0 bg-gradient-to-r from-[#0b0f19] via-[#0b0f19]/85 to-transparent w-full lg:w-3/4" />
       <div className="absolute top-0 right-0 w-96 h-96 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />
 
       {/* Content Container */}
-      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-full flex flex-col justify-end pb-16 md:pb-24 z-10">
-        <div className="max-w-2xl space-y-4">
+      <div className="relative w-full max-w-[1920px] mx-auto px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 h-full flex flex-col justify-end pb-16 md:pb-24 z-10">
+        <div className="max-w-3xl space-y-4">
           {/* Streamline Tag & Metadata strip */}
           <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
             <span className="px-2.5 py-0.5 rounded-md bg-[#e5a93c] text-black font-extrabold tracking-wider uppercase text-[11px] shadow-sm">

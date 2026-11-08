@@ -68,7 +68,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <header className="sticky top-0 z-40 w-full bg-[#0b0f19]/90 backdrop-blur-md border-b border-white/10 transition-colors">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-2 sm:gap-4">
+      <div className="w-full max-w-[1920px] mx-auto px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 h-16 flex items-center justify-between gap-3 sm:gap-6">
         {/* Left: Brand & Desktop Nav Links */}
         <div className="flex items-center gap-3 lg:gap-6 shrink-0">
           {/* SODON AI MOVIE Typography Wordmark */}

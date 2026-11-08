@@ -32,7 +32,7 @@ export const PricingView: React.FC<PricingViewProps> = ({
   };
 
   return (
-    <div className="py-14 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto select-none">
+    <div className="py-14 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1600px] mx-auto select-none">
       {/* Header */}
       <div className="text-center max-w-3xl mx-auto space-y-4">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-md text-xs font-black uppercase tracking-wider bg-[#e5a93c]/15 text-[#e5a93c] border border-[#e5a93c]/30">

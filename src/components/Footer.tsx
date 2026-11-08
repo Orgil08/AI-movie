@@ -13,8 +13,8 @@ export const Footer: React.FC<FooterProps> = ({ onNavClick, onOpenDocs }) => {
   const { locale } = useLocale();
 
   return (
-    <footer className="w-full bg-[#070a12] border-t border-white/10 text-slate-400 text-xs py-14 px-4 sm:px-6 lg:px-8 select-none">
-      <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-12 gap-10">
+    <footer className="w-full bg-[#070a12] border-t border-white/10 text-slate-400 text-xs py-14 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 select-none">
+      <div className="w-full max-w-[1920px] mx-auto grid grid-cols-1 md:grid-cols-12 gap-10">
         {/* Brand & Description */}
         <div className="md:col-span-5 space-y-4">
             <div className="flex items-baseline gap-2">
@@ -126,7 +126,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavClick, onOpenDocs }) => {
         </div>
       </div>
 
-      <div className="max-w-7xl mx-auto mt-12 pt-6 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between gap-4 text-[11px] text-slate-500">
+      <div className="w-full max-w-[1920px] mx-auto mt-12 pt-6 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between gap-4 text-[11px] text-slate-500">
         <div>
           © {new Date().getFullYear()} SODON AI MOVIE. {t('copyright')}
         </div>

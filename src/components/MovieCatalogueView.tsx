@@ -75,7 +75,7 @@ export const MovieCatalogueView: React.FC<MovieCatalogueViewProps> = ({
   }, [searchQuery, selectedGenre, selectedQuality, locale]);
 
   return (
-    <div className="py-10 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto space-y-8 select-none">
+    <div className="py-10 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1920px] mx-auto space-y-8 select-none">
       {/* Header */}
       <div className="border-b border-white/10 pb-6 flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
@@ -159,7 +159,7 @@ export const MovieCatalogueView: React.FC<MovieCatalogueViewProps> = ({
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 sm:gap-5">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 sm:gap-5">
           {filteredMovies.map((movie) => {
             const isLocked = movie.isPremium && !hasActiveSubscription;
             const movieTitle = getLocalizedMovieText(movie.title, locale, movie.titleMn);

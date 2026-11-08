@@ -45,7 +45,7 @@ export const StreamlineShowcase: React.FC = () => {
     <div className="w-full bg-[#070a12] border-t border-white/10 text-white select-none">
       {/* 1. Statistics Bar */}
       <section className="py-12 border-b border-white/10 bg-gradient-to-b from-[#0b0f19] to-[#070a12]">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="w-full max-w-[1920px] mx-auto px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-6 text-center">
             {stats.map((stat, idx) => (
               <div
@@ -65,7 +65,7 @@ export const StreamlineShowcase: React.FC = () => {
       </section>
 
       {/* 2. Device Showcase */}
-      <section className="py-16 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto">
+      <section className="py-16 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1920px] mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-center">
           {/* Left Text & Device Specs */}
           <div className="lg:col-span-5 space-y-6">

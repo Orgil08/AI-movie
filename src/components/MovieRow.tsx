@@ -26,7 +26,7 @@ export const MovieRow: React.FC<MovieRowProps> = ({
   const tMovies = useTranslations('Movies');
 
   return (
-    <section className="py-7 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto">
+    <section className="py-7 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1920px] mx-auto">
       {/* Streamline Section Header */}
       <div className="mb-4 flex items-end justify-between">
         <div>
@@ -40,7 +40,7 @@ export const MovieRow: React.FC<MovieRowProps> = ({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 sm:gap-5">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 sm:gap-5">
         {movies.map((movie) => {
           const isLocked = movie.isPremium && !hasActiveSubscription;
           const movieTitle = getLocalizedMovieText(movie.title, locale, movie.titleMn);
