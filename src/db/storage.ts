@@ -24,6 +24,7 @@ import { MOVIES } from '../data/movies.js';
 mongoose.set('bufferCommands', false);
 
 let isConnected = false;
+let connectionPromise: Promise<boolean> | null = null;
 
 export async function connectDB(): Promise<boolean> {
   const uri = process.env.MONGODB_URI;
@@ -33,26 +34,45 @@ export async function connectDB(): Promise<boolean> {
   }
 
   if (isConnected && mongoose.connection.readyState === 1) return true;
-
-  try {
-    await mongoose.connect(uri, {
-      serverSelectionTimeoutMS: 2000,
-      connectTimeoutMS: 2000
-    });
-    isConnected = mongoose.connection.readyState === 1;
-    if (isConnected) {
-      console.log('[Database] Connected successfully to MongoDB Atlas');
-    }
-    return isConnected;
-  } catch (err) {
-    isConnected = false;
-    console.warn('[Database] MongoDB Atlas connection failed, falling back to local storage:', (err as Error).message);
-    return false;
+  if (mongoose.connection.readyState === 1) {
+    isConnected = true;
+    return true;
   }
+  if (connectionPromise) return connectionPromise;
+
+  connectionPromise = (async () => {
+    try {
+      await mongoose.connect(uri, {
+        serverSelectionTimeoutMS: 5000,
+        connectTimeoutMS: 5000,
+        maxPoolSize: 10
+      });
+      isConnected = mongoose.connection.readyState === 1;
+      if (isConnected) {
+        console.log('[Database] Connected successfully to MongoDB Atlas');
+      }
+      return isConnected;
+    } catch (err) {
+      isConnected = false;
+      console.error('[Database] MongoDB connection failed:', (err as Error).message);
+      return false;
+    } finally {
+      connectionPromise = null;
+    }
+  })();
+
+  return connectionPromise;
 }
 
 export function isMongoActive(): boolean {
   return isConnected && mongoose.connection.readyState === 1;
+}
+
+/** Production user/auth operations must never fall back to ephemeral memory data. */
+function requireMongoInProduction(isMongo: boolean): void {
+  if (process.env.NODE_ENV === 'production' && !isMongo) {
+    throw new Error('MongoDB is unavailable; production user data cannot use the in-memory store.');
+  }
 }
 
 /**
@@ -68,7 +88,11 @@ class MemoryDatabase {
   public auditLogs: IAuditLog[] = [];
 
   constructor() {
-    this.seedDemoData();
+    // Demo accounts are useful in local development and tests only.
+    // Production must always authenticate against MongoDB records.
+    if (process.env.NODE_ENV !== 'production') {
+      this.seedDemoData();
+    }
   }
 
   private seedDemoData() {
@@ -627,6 +651,7 @@ export const Storage = {
   // -------------------------------------------------------------
   async createUser(user: { name: string; email: string; passwordHash: string; role?: string }): Promise<IUser> {
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     const created: IUser = {
       name: user.name.trim(),
       email: user.email.trim().toLowerCase(),
@@ -650,6 +675,7 @@ export const Storage = {
           createdAt: doc.createdAt
         };
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.createUser] MongoDB error, falling back to memory store:', (err as Error).message);
       }
     }
@@ -663,6 +689,7 @@ export const Storage = {
   async getUserByEmail(email: string): Promise<IUser | null> {
     const normalized = email.trim().toLowerCase();
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         const doc = await UserModel.findOne({ email: normalized }).lean();
@@ -679,6 +706,7 @@ export const Storage = {
           };
         }
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.getUserByEmail] MongoDB error:', (err as Error).message);
       }
     }
@@ -697,6 +725,7 @@ export const Storage = {
 
   async getUserById(id: string): Promise<IUser | null> {
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         const doc = await UserModel.findById(id).lean();
@@ -713,7 +742,10 @@ export const Storage = {
           };
         }
       } catch (err) {
-        // ID might not be a valid MongoDB ObjectId (e.g. user_batbayar)
+        // A malformed/non-ObjectId identifier is an expected miss. Other DB
+        // failures must not downgrade production auth to the memory store.
+        if ((err as any)?.name === 'CastError') return null;
+        if (process.env.NODE_ENV === 'production') throw err;
       }
     }
 
@@ -730,6 +762,7 @@ export const Storage = {
 
   async getAllUsers(): Promise<IUser[]> {
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         const docs = await UserModel.find().sort({ createdAt: -1 }).lean();
@@ -746,6 +779,7 @@ export const Storage = {
           }));
         }
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.getAllUsers] MongoDB error:', (err as Error).message);
       }
     }
@@ -774,6 +808,7 @@ export const Storage = {
     }
 
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         const updated = await UserModel.findByIdAndUpdate(userId, { role }, { new: true }).lean();
@@ -789,6 +824,7 @@ export const Storage = {
           };
         }
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.setUserRole] MongoDB update error:', (err as Error).message);
       }
     }
@@ -811,6 +847,7 @@ export const Storage = {
     }
 
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         const updated = await UserModel.findByIdAndUpdate(userId, { status }, { new: true }).lean();
@@ -826,6 +863,7 @@ export const Storage = {
           };
         }
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.setUserStatus] MongoDB error:', (err as Error).message);
       }
     }
@@ -841,6 +879,7 @@ export const Storage = {
     if (!target) throw new Error('Хэрэглэгч олдсонгүй.');
 
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         const updated = await UserModel.findByIdAndUpdate(userId, updates, { new: true }).lean();
@@ -857,6 +896,7 @@ export const Storage = {
           };
         }
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.updateUser] MongoDB error:', (err as Error).message);
       }
     }
@@ -873,11 +913,13 @@ export const Storage = {
     if (!target) return false;
 
     const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
     if (isMongo) {
       try {
         await UserModel.findByIdAndUpdate(userId, { passwordHash });
         return true;
       } catch (err) {
+        if (process.env.NODE_ENV === 'production') throw err;
         console.warn('[Storage.updateUserPassword] MongoDB error:', (err as Error).message);
       }
     }

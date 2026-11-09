@@ -137,12 +137,7 @@ function AppContent() {
 
   const fetchUserAndSubscription = async () => {
     try {
-      const storedUid = typeof window !== 'undefined' ? localStorage.getItem('ai_movie_uid') : null;
-      const headers: Record<string, string> = {};
-      if (storedUid) {
-        headers['x-user-id'] = storedUid;
-      }
-      const res = await fetch('/api/auth/me', { headers });
+      const res = await fetch('/api/auth/me', { credentials: 'same-origin' });
       if (res.ok) {
         const data = await res.json();
         setCurrentUser(data.user || null);
@@ -160,9 +155,9 @@ function AppContent() {
       }
       const res = await fetch('/api/auth/switch-user', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': userId
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ userId })
       });

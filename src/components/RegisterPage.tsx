@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Film, Mail, Lock, User as UserIcon, Eye, EyeOff, AlertCircle, ArrowRight, CheckCircle2, ShieldCheck } from 'lucide-react';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
-import { setStoredUserId } from '../utils/api.js';
+import { getCsrfToken, readApiJson, setStoredUserId } from '../utils/api.js';
 
 interface RegisterPageProps {
   onSuccess: (user: { id: string; name: string; email: string; role?: 'user' | 'admin' }) => void;
@@ -56,19 +56,22 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
     setLoading(true);
 
     try {
+      const csrfToken = await getCsrfToken();
       const res = await fetch('/api/auth/register', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: name.trim(),
           email: email.trim(),
           password,
           confirmPassword,
-          terms
+          terms,
+          csrfToken
         })
       });
 
-      const data = await res.json();
+      const data = await readApiJson<{ error?: string; message?: string; user?: { id: string; name: string; email: string; role?: 'user' | 'admin' } }>(res);
 
       if (!res.ok) {
         if (data.error === 'EMAIL_ALREADY_EXISTS') {
@@ -80,6 +83,10 @@ export const RegisterPage: React.FC<RegisterPageProps> = ({
       }
 
       // Success: automatically log the user in and enter the app!
+      if (!data.user?.id) {
+        setError(tAuth('authFailed'));
+        return;
+      }
       setStoredUserId(data.user.id);
       onSuccess(data.user);
     } catch (err: any) {

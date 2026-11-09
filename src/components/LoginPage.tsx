@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { Film, Mail, Lock, Eye, EyeOff, AlertCircle, ArrowRight, CheckCircle2, Shield, Sparkles } from 'lucide-react';
+import { Film, Mail, Lock, Eye, EyeOff, AlertCircle, ArrowRight, CheckCircle2, Shield } from 'lucide-react';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
-import { setStoredUserId } from '../utils/api.js';
+import { getCsrfToken, readApiJson, setStoredUserId } from '../utils/api.js';
 
 interface LoginPageProps {
   onSuccess: (user: { id: string; name: string; email: string; role: 'user' | 'admin' }) => void;
@@ -28,19 +28,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [loading, setLoading] = useState(false);
   const [forgotModalOpen, setForgotModalOpen] = useState(false);
 
-  const demoAccounts = [
-    { name: 'Системийн Администратор', role: 'admin', email: 'admin@aimovie.mn', password: 'password123', badge: 'ADMIN' },
-    { name: 'Тэмүүлэн', role: 'user', email: 'temuulen@aimovie.mn', password: 'password123', badge: 'VIP 4K' },
-    { name: 'Энхжин', role: 'user', email: 'enkhjin@aimovie.mn', password: 'password123', badge: 'СТАНДАРТ' },
-    { name: 'Батбаяр', role: 'user', email: 'batbayar@aimovie.mn', password: 'password123', badge: 'USER' }
-  ];
-
-  const handleDemoClick = (acc: typeof demoAccounts[0]) => {
-    setEmail(acc.email);
-    setPassword(acc.password);
-    setError(null);
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -54,13 +41,15 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     setLoading(true);
 
     try {
+      const csrfToken = await getCsrfToken();
       const res = await fetch('/api/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password, remember: rememberMe })
+        body: JSON.stringify({ email: email.trim(), password, remember: rememberMe, csrfToken })
       });
 
-      const data = await res.json();
+      const data = await readApiJson<{ error?: string; message?: string; user?: { id: string; name: string; email: string; role: 'user' | 'admin' } }>(res);
 
       if (!res.ok) {
         if (data.error === 'ACCOUNT_NOT_FOUND') {
@@ -75,6 +64,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         return;
       }
 
+      if (!data.user?.id) {
+        setError(tAuth('authFailed'));
+        return;
+      }
       setStoredUserId(data.user.id);
       onSuccess(data.user);
     } catch (err: any) {
@@ -236,38 +229,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           </button>
         </div>
 
-        {/* 1-Click Demo Accounts for Fast Testing & Verification */}
-        <div className="pt-3 border-t border-white/10 space-y-2.5">
-          <div className="flex items-center gap-1.5 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
-            <Sparkles className="w-3.5 h-3.5 text-[#e5a93c]" />
-            <span>{tAuth('demoAccountsTitle')}</span>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2 text-xs">
-            {demoAccounts.map((acc) => (
-              <button
-                key={acc.email}
-                type="button"
-                onClick={() => handleDemoClick(acc)}
-                className="p-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-left transition cursor-pointer flex flex-col gap-0.5"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="font-bold text-white text-[11px] truncate">{acc.name}</span>
-                  <span
-                    className={`text-[9px] px-1 py-0.2 rounded font-black ${
-                      acc.role === 'admin'
-                        ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
-                        : 'bg-amber-500/20 text-[#e5a93c]'
-                    }`}
-                  >
-                    {acc.badge}
-                  </span>
-                </div>
-                <span className="text-[10px] text-slate-400 truncate">{acc.email}</span>
-              </button>
-            ))}
-          </div>
-        </div>
       </div>
 
       {/* Forgot Password Modal */}

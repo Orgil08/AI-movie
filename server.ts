@@ -10,6 +10,7 @@ import { SUBSCRIPTION_PLANS, isValidPlanId, getPlanById } from './src/config/sub
 import { BANK_TRANSFER_DETAILS } from './src/config/bank-details.js';
 import { MOVIES, getMovieById } from './src/data/movies.js';
 import { hashPassword, verifyPassword } from './src/utils/crypto.js';
+import { createSignedSessionToken, safeStringEqual, verifySignedSessionToken } from './src/utils/session.js';
 import { getPageMetadata } from './src/i18n/seo.js';
 import { getLocaleFromPath } from './src/i18n/routing.js';
 import {
@@ -29,6 +30,61 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProduction = process.env.NODE_ENV === 'production';
+const SESSION_COOKIE = 'ai_movie_uid';
+const CSRF_COOKIE = 'ai_movie_csrf';
+
+function getAuthSecret(): string {
+  const secret = process.env.AUTH_SECRET;
+  if (secret && secret.length >= 32) return secret;
+  if (isProduction) {
+    throw new Error('AUTH_SECRET must be configured with at least 32 characters in production.');
+  }
+  return secret || 'local-development-only-ai-movie-session-secret';
+}
+
+function readCookie(req: Request, cookieName: string): string | null {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+
+  for (const part of cookieHeader.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim() !== cookieName) continue;
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function createSessionToken(userId: string, maxAgeSeconds: number) {
+  return createSignedSessionToken(userId, getAuthSecret(), maxAgeSeconds);
+}
+
+function verifySessionToken(token: string | null) {
+  return verifySignedSessionToken(token, getAuthSecret());
+}
+
+function setSessionCookie(res: Response, userId: string, maxAgeSeconds: number): void {
+  const { token } = createSessionToken(userId, maxAgeSeconds);
+  const secure = isProduction ? '; Secure' : '';
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`
+  );
+}
+
+function requireCsrf(req: Request, res: Response, next: NextFunction): void {
+  const cookieToken = readCookie(req, CSRF_COOKIE);
+  const requestToken = (req.get('x-csrf-token') || req.body?.csrfToken || '').toString();
+  if (!cookieToken || !requestToken || !safeStringEqual(cookieToken, requestToken)) {
+    res.status(403).json({ error: 'CSRF_VALIDATION_FAILED', message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.' });
+    return;
+  }
+  next();
+}
 
 export interface AuthenticatedUser {
   id: string;
@@ -38,41 +94,22 @@ export interface AuthenticatedUser {
   status: 'active' | 'suspended';
 }
 
-// User resolution helper (supports cookie, auth header, or registered users in database)
+// User resolution uses a signed, expiring HttpOnly cookie. A client-supplied
+// user ID header is never accepted as proof of authentication.
 async function getAuthenticatedUser(req: Request): Promise<AuthenticatedUser | null> {
-  const headerUserId = req.headers['x-user-id'] as string;
-  const cookieMatch = req.headers.cookie?.match(/ai_movie_uid=([^;]+)/);
-  const cookieUserId = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
+  const claims = verifySessionToken(readCookie(req, SESSION_COOKIE));
+  if (!claims) return null;
 
-  const userId = headerUserId || cookieUserId;
-  if (!userId) {
-    return null;
-  }
+  const dbUser = await Storage.getUserById(claims.userId);
+  if (!dbUser || dbUser.status === 'suspended') return null;
 
-  const dbUser = await Storage.getUserById(userId);
-  if (dbUser) {
-    const role: 'user' | 'admin' = dbUser.role === 'admin' ? 'admin' : 'user';
-    return {
-      id: dbUser.id || userId,
-      name: dbUser.name,
-      email: dbUser.email,
-      role,
-      status: (dbUser.status as any) || 'active'
-    };
-  }
-
-  const userDirectory: Record<string, AuthenticatedUser> = {
-    user_admin: { id: 'user_admin', name: 'Системийн Администратор', email: 'admin@aimovie.mn', role: 'admin', status: 'active' },
-    user_temuulen: { id: 'user_temuulen', name: 'Тэмүүлэн', email: 'temuulen@aimovie.mn', role: 'user', status: 'active' },
-    user_batbayar: { id: 'user_batbayar', name: 'Батбаяр', email: 'batbayar@aimovie.mn', role: 'user', status: 'active' },
-    user_enkhjin: { id: 'user_enkhjin', name: 'Энхжин', email: 'enkhjin@aimovie.mn', role: 'user', status: 'active' }
+  return {
+    id: dbUser.id || claims.userId,
+    name: dbUser.name,
+    email: dbUser.email,
+    role: dbUser.role === 'admin' ? 'admin' : 'user',
+    status: (dbUser.status as 'active' | 'suspended') || 'active'
   };
-
-  if (userDirectory[userId]) {
-    return userDirectory[userId];
-  }
-
-  return { id: userId, name: userId, email: `${userId}@aimovie.mn`, role: 'user', status: 'active' };
 }
 
 // Server-side authentication guard for user endpoints
@@ -129,6 +166,30 @@ function getBaseUrl(req: Request): string {
   return `${protocol}://${host}`;
 }
 
+// Fail closed on Vercel/production: never silently authenticate against the
+// seeded in-memory development database when MongoDB is unavailable.
+app.use('/api', async (_req: Request, res: Response, next: NextFunction) => {
+  if (!isProduction) return next();
+
+  if (!process.env.MONGODB_URI || process.env.MONGODB_URI.includes('<') || process.env.MONGODB_URI.includes('>')) {
+    return res.status(503).json({ error: 'DATABASE_NOT_CONFIGURED', message: 'Production MongoDB connection is not configured.' });
+  }
+  if (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < 32) {
+    return res.status(503).json({ error: 'AUTH_SECRET_NOT_CONFIGURED', message: 'Production authentication secret is not configured.' });
+  }
+
+  try {
+    const connected = await connectDB();
+    if (!connected) {
+      return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Authentication service is temporarily unavailable.' });
+    }
+    return next();
+  } catch (error) {
+    console.error('[API] Production database initialization failed:', error);
+    return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Authentication service is temporarily unavailable.' });
+  }
+});
+
 // -------------------------------------------------------------
 // 1. Raw body parsing for Webhooks (MUST be before express.json)
 // -------------------------------------------------------------
@@ -146,6 +207,51 @@ app.use(express.json());
 // -------------------------------------------------------------
 // 2. Authentication Endpoints (Sign In, Sign Up, Sign Out, Me)
 // -------------------------------------------------------------
+
+// Custom Express authentication discovery/session endpoints. This project
+// does not use NextAuth/Auth.js; these expose the existing credentials auth
+// contract as JSON for health checks and clients that probe these URLs.
+app.get('/api/auth/providers', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
+    credentials: {
+      id: 'credentials',
+      name: 'Email and Password',
+      type: 'credentials',
+      signInUrl: '/api/auth/login',
+      signUpUrl: '/api/auth/register'
+    }
+  });
+});
+
+app.get('/api/auth/csrf', (_req: Request, res: Response) => {
+  const csrfToken = crypto.randomBytes(32).toString('hex');
+  const secure = isProduction ? '; Secure' : '';
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader(
+    'Set-Cookie',
+    `${CSRF_COOKIE}=${encodeURIComponent(csrfToken)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600${secure}`
+  );
+  return res.json({ csrfToken });
+});
+
+app.get('/api/auth/session', async (req: Request, res: Response) => {
+  try {
+    const claims = verifySessionToken(readCookie(req, SESSION_COOKIE));
+    const user = claims ? await getAuthenticatedUser(req) : null;
+    const subscription = user ? await Storage.getActiveSubscription(user.id) : null;
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+      user: user ? { id: user.id, name: user.name, email: user.email, role: user.role } : null,
+      expires: claims ? new Date(claims.expiresAt * 1000).toISOString() : null,
+      subscription
+    });
+  } catch (error) {
+    console.error('[Auth/Session] Error:', error);
+    return res.status(500).json({ error: 'SESSION_LOOKUP_FAILED', message: 'Session шалгахад алдаа гарлаа.' });
+  }
+});
 
 // Context Endpoint: returns current user and active subscription
 app.get('/api/auth/me', async (req: Request, res: Response) => {
@@ -182,7 +288,7 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
 });
 
 // User Registration: Sign Up with Zod validation, role="user" strict enforcement, bcrypt hashing
-app.post('/api/auth/register', async (req: Request, res: Response) => {
+app.post('/api/auth/register', requireCsrf, async (req: Request, res: Response) => {
   try {
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     if (!checkRateLimit(`reg_${clientIp}`, 15)) {
@@ -220,7 +326,7 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
       role: 'user'
     });
 
-    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(newUser.id!)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+    setSessionCookie(res, newUser.id!, 30 * 24 * 60 * 60);
 
     return res.status(201).json({
       success: true,
@@ -239,7 +345,7 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
 });
 
 // User Login: Sign In with Zod validation, credential check, remember me, and role redirection support
-app.post('/api/auth/login', async (req: Request, res: Response) => {
+app.post('/api/auth/login', requireCsrf, async (req: Request, res: Response) => {
   try {
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     if (!checkRateLimit(`login_${clientIp}`, 20)) {
@@ -285,7 +391,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
     await Storage.updateUser(user.id!, { lastLoginAt: new Date() });
 
     const maxAge = remember ? 30 * 24 * 60 * 60 : 24 * 60 * 60; // 30 days or session day
-    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(user.id!)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
+    setSessionCookie(res, user.id!, maxAge);
 
     const subscription = await Storage.getActiveSubscription(user.id!);
 
@@ -369,19 +475,32 @@ app.post('/api/auth/change-password', requireAuth, async (req: Request, res: Res
 
 // User Sign Out: Clears session cookie
 app.post('/api/auth/logout', (_req: Request, res: Response) => {
-  res.setHeader('Set-Cookie', 'ai_movie_uid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  const secure = isProduction ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
   return res.json({ success: true, message: 'Амжилттай гарлаа.' });
 });
 
-// Quick Switch User (demo test helper)
+// Quick switch is intentionally unavailable in production. Development-only
+// switching still verifies that the target record exists in the database.
 app.post('/api/auth/switch-user', (req: Request, res: Response) => {
+  if (isProduction) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Энэ endpoint production орчинд идэвхгүй.' });
+  }
   const { userId } = req.body;
   if (!userId) {
     return res.status(400).json({ error: 'User ID is required' });
   }
 
-  res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(userId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
-  res.json({ success: true, userId });
+  void Storage.getUserById(String(userId)).then((targetUser) => {
+    if (!targetUser) {
+      return res.status(404).json({ error: 'USER_NOT_FOUND', message: 'Хэрэглэгч олдсонгүй.' });
+    }
+    setSessionCookie(res, targetUser.id!, 30 * 24 * 60 * 60);
+    return res.json({ success: true, userId: targetUser.id });
+  }).catch((error) => {
+    console.error('[Auth/SwitchUser] Error:', error);
+    return res.status(500).json({ error: 'SERVER_ERROR', message: 'Хэрэглэгч солиход алдаа гарлаа.' });
+  });
 });
 
 // =============================================================
@@ -818,23 +937,10 @@ app.post('/api/admin/upload', requireAdmin, async (req: Request, res: Response) 
   }
 });
 
-// User Sign Out: Clears session cookie
-app.post('/api/auth/logout', (_req: Request, res: Response) => {
-  res.setHeader('Set-Cookie', 'ai_movie_uid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
-  return res.json({ success: true, message: 'Амжилттай гарлаа.' });
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, service: 'ai-movie-api' });
 });
-
-// Quick Switch User (demo test helper)
-app.post('/api/auth/switch-user', (req: Request, res: Response) => {
-  const { userId } = req.body;
-  if (!userId) {
-    return res.status(400).json({ error: 'User ID is required' });
-  }
-
-  res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(userId)}; Path=/; HttpOnly; SameSite=Lax`);
-  res.json({ success: true, userId });
-});
-
 
 // -------------------------------------------------------------
 // 3. Subscription Info
@@ -1388,7 +1494,7 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
   // Create signed token with 2 hour expiration
   const userId = user ? user.id : 'guest';
   const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
-  const tokenSecret = process.env.AUTH_SECRET || 'ai_movie_secret_stream_key';
+  const tokenSecret = getAuthSecret();
   const tokenPayload = `${movie.id}:${userId}:${expiresAt}`;
   const signedToken = crypto.createHmac('sha256', tokenSecret).update(tokenPayload).digest('hex');
 
@@ -1409,6 +1515,9 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
 // for testing and validation
 // -------------------------------------------------------------
 app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) => {
+  if (isProduction) {
+    return res.status(404).json({ error: 'NOT_FOUND', message: 'Payment simulation is disabled in production.' });
+  }
   try {
     const { orderNumber } = req.body;
     if (!orderNumber) {
@@ -1501,6 +1610,15 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
   }
 });
 
+// API paths must always produce JSON, including unknown endpoints. Register
+// this only after every API route so valid routes are not shadowed.
+app.use('/api', (_req: Request, res: Response) => {
+  return res.status(404).json({
+    error: 'API_ROUTE_NOT_FOUND',
+    message: 'API endpoint олдсонгүй.'
+  });
+});
+
 // -------------------------------------------------------------
 // 10. Dynamic SEO Metadata Injection & Vite Integration
 // -------------------------------------------------------------
@@ -1553,19 +1671,10 @@ function injectSeoIntoHtml(htmlTemplate: string, req: Request): string {
   return html;
 }
 
-async function startServer() {
-  await connectDB();
-
-  let vite: any = null;
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'custom'
-    });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.join(__dirname, 'dist'), { index: false }));
+function registerHtmlRoutes(vite: any = null) {
+  const distDir = path.resolve(process.cwd(), 'dist');
+  if (isProduction) {
+    app.use(express.static(distDir, { index: false }));
   }
 
   // Handle all HTML/navigation routes with dynamic localized SEO metadata
@@ -1582,7 +1691,7 @@ async function startServer() {
         template = fs.readFileSync(path.resolve(__dirname, 'index.html'), 'utf-8');
         template = await vite.transformIndexHtml(url, template);
       } else {
-        template = fs.readFileSync(path.resolve(__dirname, 'dist', 'index.html'), 'utf-8');
+        template = fs.readFileSync(path.join(distDir, 'index.html'), 'utf-8');
       }
 
       const localizedHtml = injectSeoIntoHtml(template, req);
@@ -1594,12 +1703,41 @@ async function startServer() {
       next(e);
     }
   });
+}
+
+async function startServer() {
+  if (isProduction) {
+    const connected = await connectDB();
+    if (!connected) {
+      throw new Error('Production server cannot start without an active MongoDB connection.');
+    }
+    registerHtmlRoutes();
+  } else {
+    await connectDB();
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'custom'
+    });
+    app.use(vite.middlewares);
+    registerHtmlRoutes(vite);
+  }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[AI MOVIE] Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('[AI MOVIE] Server startup failed:', err);
-});
+// Vercel imports this Express application as a serverless API function.
+// Do not start a long-lived listener inside a serverless invocation.
+if (isProduction && process.env.VERCEL === '1') {
+  registerHtmlRoutes();
+} else if (process.env.VERCEL !== '1') {
+  startServer().catch((err) => {
+    console.error('[AI MOVIE] Server startup failed:', err);
+    process.exitCode = 1;
+  });
+}
+
+// Keep the existing Express + MongoDB backend; no mock Auth.js/Next.js layer.
+export default app;

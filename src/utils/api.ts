@@ -1,7 +1,6 @@
 /**
- * Client authentication helper utilities.
- * Ensures seamless user session persistence across cross-origin iframes,
- * browser refreshes, and third-party cookie restrictions.
+ * Client authentication helper utilities. User IDs are display hints only;
+ * authorization is carried by a signed HttpOnly session cookie.
  */
 
 const STORAGE_KEY = 'ai_movie_uid';
@@ -29,21 +28,62 @@ export function clearStoredUserId(): void {
   } catch {}
 }
 
-/**
- * Universal fetch wrapper that attaches 'x-user-id' from localStorage
- * so that authenticated requests always work in iframe environments
- * even when third-party cookies are blocked or partitioned.
- */
+/** Same-origin API wrapper; authentication is carried only by the signed HttpOnly cookie. */
 export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
-  const uid = getStoredUserId();
   const headers = new Headers(init.headers || {});
-  
-  if (uid && !headers.has('x-user-id')) {
-    headers.set('x-user-id', uid);
-  }
 
   return fetch(input, {
     ...init,
+    credentials: 'same-origin',
     headers
   });
+}
+
+export interface ApiErrorPayload {
+  error?: string;
+  message?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Parse an API response without assuming that every server error is JSON.
+ * Vercel and reverse proxies can return HTML/text for missing functions.
+ */
+export async function readApiJson<T extends ApiErrorPayload = ApiErrorPayload>(
+  response: Response
+): Promise<T> {
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+  const body = await response.text();
+
+  if (!contentType.includes('application/json')) {
+    const detail = body.replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (response.status === 404) {
+      throw new Error('API endpoint олдсонгүй (404). Vercel дээр backend API function deploy хийгдсэн эсэхийг шалгана уу.');
+    }
+    throw new Error(
+      `Сервер JSON биш хариу буцаалаа (HTTP ${response.status}).${detail ? ` ${detail}` : ''}`
+    );
+  }
+
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new Error(`Серверийн JSON хариу буруу форматтай байна (HTTP ${response.status}).`);
+  }
+}
+
+/** Obtain the same-origin CSRF token before a state-changing auth request. */
+export async function getCsrfToken(): Promise<string> {
+  const response = await fetch('/api/auth/csrf', {
+    method: 'GET',
+    credentials: 'same-origin',
+    cache: 'no-store'
+  });
+  const data = await readApiJson<{ csrfToken?: string; message?: string }>(response);
+
+  if (!response.ok || !data.csrfToken) {
+    throw new Error(data.message || 'CSRF token авахад алдаа гарлаа.');
+  }
+
+  return data.csrfToken;
 }

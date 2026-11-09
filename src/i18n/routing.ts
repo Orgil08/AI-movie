@@ -18,7 +18,7 @@ export type AppLocale = (typeof routing.locales)[number];
  * Middleware matcher pattern for internationalized routes
  */
 export const I18N_MIDDLEWARE_CONFIG = {
-  matcher: ['/', '/(mn|en)/:path*', '/((?!api|_next|_vercel|.*\\..*).*)']
+  matcher: ['/', '/(mn|en)/:path*', '/((?!api|trpc|_next|_vercel|.*\\..*).*)']
 };
 
 /**

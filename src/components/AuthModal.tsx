@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { X, Film, Mail, Lock, User as UserIcon, AlertCircle, ArrowRight } from 'lucide-react';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
-import { setStoredUserId } from '../utils/api.js';
+import { getCsrfToken, readApiJson, setStoredUserId } from '../utils/api.js';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -24,6 +24,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [termsAccepted, setTermsAccepted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -38,12 +39,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         setError(tAuth('nameRequired'));
         return;
       }
-      if (password.length < 6) {
+      if (password.length < 8) {
         setError(tAuth('passwordMinLength'));
         return;
       }
       if (password !== confirmPassword) {
         setError(tAuth('passwordsDoNotMatch'));
+        return;
+      }
+      if (!termsAccepted) {
+        setError(locale === 'en' ? 'Please agree to the Terms and Conditions.' : 'Үйлчилгээний нөхцөлийг зөвшөөрнө үү.');
         return;
       }
     }
@@ -59,13 +64,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       const endpoint = mode === 'signup' ? '/api/auth/register' : '/api/auth/login';
       const payload = mode === 'signup' ? { name, email, password } : { email, password };
 
+      const csrfToken = await getCsrfToken();
       const res = await fetch(endpoint, {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(mode === 'signup'
+          ? { ...payload, confirmPassword, terms: termsAccepted, csrfToken }
+          : { ...payload, csrfToken })
       });
 
-      const data = await res.json();
+      const data = await readApiJson<{ error?: string; message?: string; user?: { id: string; name: string; email: string; role?: 'user' | 'admin' } }>(res);
 
       if (!res.ok) {
         setError(data.message || tAuth('authFailed'));
@@ -74,6 +83,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
       if (data.user?.id) {
         setStoredUserId(data.user.id);
+      } else {
+        setError(tAuth('authFailed'));
+        return;
       }
       onSuccess(data.user);
       onClose();
@@ -176,6 +188,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 />
               </div>
             </div>
+          )}
+
+          {mode === 'signup' && (
+            <label className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-400 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={termsAccepted}
+                onChange={(event) => setTermsAccepted(event.target.checked)}
+                className="mt-0.5 accent-[#e5a93c]"
+              />
+              <span>{locale === 'en' ? 'I agree to the Terms and Conditions.' : 'Би үйлчилгээний нөхцөлийг зөвшөөрч байна.'}</span>
+            </label>
           )}
 
           <div>
