@@ -1,13 +1,17 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { X, Lock, CheckCircle2, ShieldCheck, ArrowRight, Sparkles } from 'lucide-react';
+import { X, Lock, CheckCircle2, ShieldCheck, ArrowRight, Sparkles, RotateCcw } from 'lucide-react';
 import { Movie, getLocalizedMovieText } from '../data/movies.js';
 import { useLocale, useTranslations } from '../i18n/I18nContext.js';
+
+import { WatchProgress, saveWatchProgress, formatTimestamp } from '../utils/watchProgress.js';
 
 interface MoviePlayerModalProps {
   movie: Movie | null;
   onClose: () => void;
   onGoToPricing: () => void;
   hasActiveSubscription: boolean;
+  initialTime?: number;
+  onProgressUpdate?: (movieId: string, currentTime: number, duration: number) => void;
 }
 
 interface StreamResponse {
@@ -20,11 +24,24 @@ interface StreamResponse {
   expiresAt: number;
 }
 
+// Parse string duration like "2h 18m" or "45m" into seconds
+function parseDurationToSeconds(durationStr: string): number {
+  if (!durationStr) return 7200;
+  let total = 0;
+  const hoursMatch = durationStr.match(/(\d+)\s*h/i);
+  const minsMatch = durationStr.match(/(\d+)\s*m/i);
+  if (hoursMatch) total += parseInt(hoursMatch[1], 10) * 3600;
+  if (minsMatch) total += parseInt(minsMatch[1], 10) * 60;
+  return total > 0 ? total : 7200;
+}
+
 export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
   movie,
   onClose,
   onGoToPricing,
-  hasActiveSubscription
+  hasActiveSubscription,
+  initialTime = 0,
+  onProgressUpdate
 }) => {
   const { locale } = useLocale();
   const tPlayer = useTranslations('Player');
@@ -32,7 +49,10 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [streamData, setStreamData] = useState<StreamResponse | null>(null);
   const [accessDenied, setAccessDenied] = useState<string | null>(null);
+  const [resumedToast, setResumedToast] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hasSeekedInitial = useRef(false);
+  const lastSavedTime = useRef(0);
 
   useEffect(() => {
     if (!movie) {
@@ -81,6 +101,63 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
     };
   }, [movie]);
 
+  const movieDurationSeconds = movie ? parseDurationToSeconds(movie.duration) : 7200;
+
+  const handleLoadedMetadata = () => {
+    if (!hasSeekedInitial.current && initialTime > 0 && videoRef.current) {
+      try {
+        const targetTime = Math.min(initialTime, videoRef.current.duration && !isNaN(videoRef.current.duration) ? videoRef.current.duration : initialTime);
+        videoRef.current.currentTime = targetTime;
+        hasSeekedInitial.current = true;
+        setResumedToast(
+          locale === 'en'
+            ? `Resumed from ${formatTimestamp(initialTime)}`
+            : `${formatTimestamp(initialTime)} цагаас үргэлжлүүлж байна`
+        );
+        setTimeout(() => setResumedToast(null), 4000);
+      } catch (e) {
+        console.warn('Could not seek video', e);
+      }
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    if (!videoRef.current || !movie) return;
+    const current = Math.floor(videoRef.current.currentTime);
+    if (Math.abs(current - lastSavedTime.current) >= 2) {
+      lastSavedTime.current = current;
+      const duration = videoRef.current.duration && !isNaN(videoRef.current.duration) && videoRef.current.duration > 60
+        ? Math.floor(videoRef.current.duration)
+        : movieDurationSeconds;
+
+      saveWatchProgress({
+        movieId: movie.id,
+        currentTime: current,
+        duration
+      });
+
+      if (onProgressUpdate) {
+        onProgressUpdate(movie.id, current, duration);
+      }
+    }
+  };
+
+  const handleClose = () => {
+    if (videoRef.current && movie) {
+      const current = Math.floor(videoRef.current.currentTime);
+      if (current > 5) {
+        const duration = videoRef.current.duration && !isNaN(videoRef.current.duration) && videoRef.current.duration > 60
+          ? Math.floor(videoRef.current.duration)
+          : movieDurationSeconds;
+        saveWatchProgress({ movieId: movie.id, currentTime: current, duration });
+        if (onProgressUpdate) {
+          onProgressUpdate(movie.id, current, duration);
+        }
+      }
+    }
+    onClose();
+  };
+
   if (!movie) return null;
 
   const title = getLocalizedMovieText(movie.title, locale, movie.titleMn);
@@ -98,7 +175,7 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
       <div className="relative w-full max-w-4xl bg-[#0b0f19] rounded-2xl overflow-hidden border border-white/15 shadow-2xl shadow-black flex flex-col max-h-[92vh]">
         {/* Close Button */}
         <button
-          onClick={onClose}
+          onClick={handleClose}
           className="absolute top-4 right-4 z-30 w-9 h-9 rounded-full bg-black/70 hover:bg-black text-slate-300 hover:text-white flex items-center justify-center transition border border-white/10 cursor-pointer"
           aria-label="Close"
         >
@@ -134,7 +211,7 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
               <div className="flex flex-col sm:flex-row items-center gap-3 mt-6">
                 <button
                   onClick={() => {
-                    onClose();
+                    handleClose();
                     onGoToPricing();
                   }}
                   className="px-6 py-3 rounded-xl bg-gradient-to-r from-[#e5a93c] via-amber-400 to-[#e5a93c] text-black font-extrabold text-sm flex items-center gap-2 shadow-xl shadow-amber-950/40 hover:brightness-110 transition active:scale-95 cursor-pointer"
@@ -145,7 +222,7 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
                 </button>
 
                 <button
-                  onClick={onClose}
+                  onClick={handleClose}
                   className="px-5 py-3 rounded-xl bg-white/10 hover:bg-white/15 text-slate-300 text-sm font-semibold transition cursor-pointer"
                 >
                   {tPlayer('backToBrowse')}
@@ -169,6 +246,8 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
                 src={streamData.streamUrl}
                 controls
                 autoPlay
+                onLoadedMetadata={handleLoadedMetadata}
+                onTimeUpdate={handleTimeUpdate}
                 className="w-full h-full object-contain"
               >
                 {locale === 'en' ? 'Your browser does not support HTML5 video.' : 'Таны хөтөч видео тоглуулахыг дэмжихгүй байна.'}
@@ -179,6 +258,14 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                 <span>{tPlayer('authorizedStream')} ({streamData.quality})</span>
               </div>
+
+              {/* Resumed Time Offset Toast */}
+              {resumedToast && (
+                <div className="absolute bottom-16 left-1/2 -translate-x-1/2 pointer-events-none bg-black/85 backdrop-blur-md px-4 py-2 rounded-xl text-xs font-bold text-amber-300 border border-[#e5a93c]/40 flex items-center gap-2 shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-300">
+                  <RotateCcw className="w-3.5 h-3.5 text-[#e5a93c] animate-spin" />
+                  <span>{resumedToast}</span>
+                </div>
+              )}
             </div>
           ) : null}
         </div>

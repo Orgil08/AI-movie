@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Film, Mail, Lock, User as UserIcon, AlertCircle, ArrowRight } from 'lucide-react';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
+import { setStoredUserId } from '../utils/api.js';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -71,6 +72,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         return;
       }
 
+      if (data.user?.id) {
+        setStoredUserId(data.user.id);
+      }
       onSuccess(data.user);
       onClose();
     } catch (err: any) {

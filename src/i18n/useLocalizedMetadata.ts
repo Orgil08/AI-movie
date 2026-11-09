@@ -46,6 +46,18 @@ export function resolveMetadataPath(
   if (currentTab === 'payments') {
     return '/account/payments';
   }
+  if (currentTab === 'account') {
+    return '/account';
+  }
+  if (currentTab === 'login') {
+    return '/login';
+  }
+  if (currentTab === 'register') {
+    return '/register';
+  }
+  if (currentTab === 'admin') {
+    return '/admin';
+  }
   if (currentTab === 'payment-success') {
     return '/payment/success';
   }

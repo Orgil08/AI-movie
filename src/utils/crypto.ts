@@ -1,12 +1,22 @@
+import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
 
-const SALT = 'streamline_sodon_ai_movie_secret_salt_2026';
+const LEGACY_SALT = 'streamline_sodon_ai_movie_secret_salt_2026';
 
 export function hashPassword(password: string): string {
-  return crypto.pbkdf2Sync(password, SALT, 1000, 32, 'sha256').toString('hex');
+  return bcrypt.hashSync(password, 10);
 }
 
 export function verifyPassword(password: string, hash: string): boolean {
   if (!password || !hash) return false;
-  return hashPassword(password) === hash;
+  if (hash.startsWith('$2')) {
+    try {
+      return bcrypt.compareSync(password, hash);
+    } catch {
+      return false;
+    }
+  }
+  // Backward compatibility with legacy pbkdf2 hashes
+  const legacyHash = crypto.pbkdf2Sync(password, LEGACY_SALT, 1000, 32, 'sha256').toString('hex');
+  return legacyHash === hash;
 }

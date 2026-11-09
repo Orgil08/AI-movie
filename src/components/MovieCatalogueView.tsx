@@ -1,7 +1,13 @@
-import React, { useState, useMemo } from 'react';
-import { Search, Film, Star, Filter, SlidersHorizontal, Lock, Play } from 'lucide-react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { Search, Film, Star, Filter, SlidersHorizontal, Lock, Play, Clock, X, Trash2 } from 'lucide-react';
 import { Movie, MOVIES, getLocalizedMovieText } from '../data/movies.js';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
+import {
+  getRecentSearches,
+  addRecentSearch,
+  removeRecentSearch,
+  clearRecentSearches
+} from '../utils/recentSearches.js';
 
 interface MovieCatalogueViewProps {
   onPlay: (movie: Movie) => void;
@@ -21,9 +27,64 @@ export const MovieCatalogueView: React.FC<MovieCatalogueViewProps> = ({
   setSearchQuery
 }) => {
   const t = useTranslations('Movies');
+  const tSearch = useTranslations('Search');
   const { locale } = useLocale();
   const [selectedGenre, setSelectedGenre] = useState<string>('all');
   const [selectedQuality, setSelectedQuality] = useState<string>('all');
+
+  // Recent Searches state
+  const [recentSearches, setRecentSearches] = useState<string[]>(() => getRecentSearches());
+  const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
+  const searchContainerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Synchronize recent searches on mount and handle clicks outside
+  useEffect(() => {
+    setRecentSearches(getRecentSearches());
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(event.target as Node)) {
+        setIsDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
+
+  const handleSelectRecent = (query: string) => {
+    setSearchQuery(query);
+    const updated = addRecentSearch(query);
+    setRecentSearches(updated);
+    setIsDropdownOpen(false);
+  };
+
+  const handleRemoveRecent = (e: React.MouseEvent, query: string) => {
+    e.stopPropagation();
+    const updated = removeRecentSearch(query);
+    setRecentSearches(updated);
+  };
+
+  const handleClearAllRecent = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    clearRecentSearches();
+    setRecentSearches([]);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      const trimmed = searchQuery.trim();
+      if (trimmed) {
+        const updated = addRecentSearch(trimmed);
+        setRecentSearches(updated);
+        setIsDropdownOpen(false);
+      }
+    } else if (e.key === 'Escape') {
+      setIsDropdownOpen(false);
+    }
+  };
 
   const genres = [
     { id: 'all', label: t('filterAll') },
@@ -88,16 +149,104 @@ export const MovieCatalogueView: React.FC<MovieCatalogueViewProps> = ({
           <p className="text-xs sm:text-sm text-slate-400">{t('subtitle')}</p>
         </div>
 
-        {/* Search Input */}
-        <div className="relative w-full md:w-80">
-          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder={t('searchPrompt')}
-            className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-[#111827] border border-white/10 text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#e5a93c]"
-          />
+        {/* Search Container with Recent Searches Dropdown & Quick Access */}
+        <div ref={searchContainerRef} className="relative w-full md:w-96 flex flex-col gap-2">
+          <div className="relative w-full">
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+            <input
+              ref={inputRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                if (!isDropdownOpen) setIsDropdownOpen(true);
+              }}
+              onFocus={() => setIsDropdownOpen(true)}
+              onKeyDown={handleKeyDown}
+              placeholder={t('searchPrompt')}
+              className="w-full pl-10 pr-10 py-2.5 rounded-xl bg-[#111827] border border-white/10 text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#e5a93c] transition-colors"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  inputRef.current?.focus();
+                }}
+                className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-white transition-colors cursor-pointer"
+                title={tSearch('clearSearch')}
+                aria-label={tSearch('clearSearch')}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Quick Access Badges: Last 5 Searches */}
+          {recentSearches.length > 0 && (
+            <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
+              <span className="text-slate-400 flex items-center gap-1 text-[10px] uppercase font-bold tracking-wider">
+                <Clock className="w-2.5 h-2.5 text-[#e5a93c]" />
+                {tSearch('recentSearches')}:
+              </span>
+              {recentSearches.map((item) => (
+                <button
+                  key={`pill-${item}`}
+                  type="button"
+                  onClick={() => handleSelectRecent(item)}
+                  className="px-2 py-0.5 rounded-md bg-white/5 hover:bg-[#e5a93c]/20 hover:text-[#e5a93c] text-slate-300 border border-white/10 hover:border-[#e5a93c]/40 text-[11px] transition cursor-pointer flex items-center gap-1"
+                >
+                  <span className="truncate max-w-[120px]">{item}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Dropdown Menu (visible on focus / click) */}
+          {isDropdownOpen && recentSearches.length > 0 && (
+            <div className="absolute left-0 right-0 top-12 z-50 rounded-xl bg-[#0d1322] border border-[#e5a93c]/30 shadow-2xl backdrop-blur-xl p-2.5 space-y-2 animate-in fade-in duration-150">
+              {/* Header */}
+              <div className="flex items-center justify-between px-2 pt-1 pb-1.5 border-b border-white/10">
+                <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1.5 uppercase tracking-wider">
+                  <Clock className="w-3 h-3 text-[#e5a93c]" />
+                  {tSearch('recentSearches')}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleClearAllRecent}
+                  className="text-[10px] font-semibold text-rose-400 hover:text-rose-300 hover:underline flex items-center gap-1 transition cursor-pointer"
+                >
+                  <Trash2 className="w-2.5 h-2.5" />
+                  {tSearch('clearAll')}
+                </button>
+              </div>
+
+              {/* Items List (up to 5) */}
+              <div className="space-y-1">
+                {recentSearches.map((item) => (
+                  <div
+                    key={`dropdown-${item}`}
+                    onClick={() => handleSelectRecent(item)}
+                    className="flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs text-slate-200 hover:bg-white/10 hover:text-white transition group cursor-pointer"
+                  >
+                    <div className="flex items-center gap-2 truncate">
+                      <Clock className="w-3 h-3 text-slate-400 group-hover:text-[#e5a93c] transition-colors shrink-0" />
+                      <span className="truncate font-medium">{item}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => handleRemoveRecent(e, item)}
+                      className="p-1 text-slate-500 hover:text-rose-400 transition rounded hover:bg-white/5 cursor-pointer ml-2"
+                      title={locale === 'en' ? 'Remove search' : 'Устгах'}
+                      aria-label={locale === 'en' ? `Remove search ${item}` : `${item} хайлтыг устгах`}
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

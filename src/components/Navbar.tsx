@@ -6,7 +6,7 @@ import { LanguageSwitcher } from './LanguageSwitcher.js';
 interface NavbarProps {
   currentTab: string;
   setCurrentTab: (tab: string) => void;
-  currentUser: { id: string; name: string; email: string } | null;
+  currentUser: { id: string; name: string; email: string; role?: 'user' | 'admin' } | null;
   subscription: any;
   onSwitchUser: (userId: string) => void;
   onOpenDocs: () => void;
@@ -254,9 +254,21 @@ export const Navbar: React.FC<NavbarProps> = ({
                   </div>
 
                   <div className="pt-1 mt-1 border-t border-white/10 space-y-0.5">
+                    {currentUser.role === 'admin' && (
+                      <button
+                        onClick={() => {
+                          handleNavClick('admin');
+                          setUserMenuOpen(false);
+                        }}
+                        className="w-full text-left px-3 py-1.5 rounded-md text-xs font-semibold text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 flex items-center gap-2 cursor-pointer mb-1 transition"
+                      >
+                        <Shield className="w-3.5 h-3.5 text-amber-400" />
+                        <span>{locale === 'en' ? 'Admin Panel' : 'Админ самбар'}</span>
+                      </button>
+                    )}
                     <button
                       onClick={() => {
-                        handleNavClick('subscription');
+                        handleNavClick('account');
                         setUserMenuOpen(false);
                       }}
                       className="w-full text-left px-3 py-1.5 rounded-md text-xs text-slate-300 hover:bg-white/5 hover:text-white flex items-center gap-2 cursor-pointer"
@@ -301,14 +313,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           ) : (
             <div className="flex items-center gap-2">
               <button
-                onClick={() => onOpenAuth('signin')}
+                onClick={() => handleNavClick('login')}
                 className="px-3 py-1.5 rounded-lg bg-[#e5a93c] hover:bg-amber-400 text-black text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-md shadow-amber-950/30"
               >
                 <LogIn className="w-3.5 h-3.5" />
                 <span>{locale === 'en' ? 'Sign In' : 'Нэвтрэх'}</span>
               </button>
               <button
-                onClick={() => onOpenAuth('signup')}
+                onClick={() => handleNavClick('register')}
                 className="hidden sm:flex px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-white text-xs font-semibold border border-white/10 transition cursor-pointer"
               >
                 <span>{locale === 'en' ? 'Sign Up' : 'Бүртгүүлэх'}</span>
@@ -397,7 +409,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <button
                   onClick={() => {
                     setMobileMenuOpen(false);
-                    onOpenAuth('signin');
+                    handleNavClick('login');
                   }}
                   className="py-2 px-3 rounded-lg bg-[#e5a93c] text-black text-xs font-bold text-center"
                 >
@@ -406,7 +418,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <button
                   onClick={() => {
                     setMobileMenuOpen(false);
-                    onOpenAuth('signup');
+                    handleNavClick('register');
                   }}
                   className="py-2 px-3 rounded-lg bg-white/10 text-white text-xs font-bold text-center"
                 >

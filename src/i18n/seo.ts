@@ -60,6 +60,14 @@ export function getPageMetadata(
     routeKey = 'subscription';
   } else if (cleanPath.startsWith('/account/payments') || cleanPath.startsWith('/payments')) {
     routeKey = 'payments';
+  } else if (cleanPath.startsWith('/login')) {
+    routeKey = 'login';
+  } else if (cleanPath.startsWith('/register')) {
+    routeKey = 'register';
+  } else if (cleanPath.startsWith('/admin')) {
+    routeKey = 'admin';
+  } else if (cleanPath.startsWith('/account')) {
+    routeKey = 'account';
   } else if (cleanPath.startsWith('/payment/success')) {
     routeKey = 'paymentSuccess';
   } else if (cleanPath.startsWith('/payment/cancel')) {

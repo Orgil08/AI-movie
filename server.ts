@@ -12,6 +12,14 @@ import { MOVIES, getMovieById } from './src/data/movies.js';
 import { hashPassword, verifyPassword } from './src/utils/crypto.js';
 import { getPageMetadata } from './src/i18n/seo.js';
 import { getLocaleFromPath } from './src/i18n/routing.js';
+import {
+  registerSchema,
+  loginSchema,
+  movieSchema,
+  categorySchema,
+  changePasswordSchema,
+  updateProfileSchema
+} from './src/utils/validation.js';
 
 dotenv.config();
 
@@ -22,8 +30,16 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
+export interface AuthenticatedUser {
+  id: string;
+  name: string;
+  email: string;
+  role: 'user' | 'admin';
+  status: 'active' | 'suspended';
+}
+
 // User resolution helper (supports cookie, auth header, or registered users in database)
-async function getAuthenticatedUser(req: Request): Promise<{ id: string; name: string; email: string } | null> {
+async function getAuthenticatedUser(req: Request): Promise<AuthenticatedUser | null> {
   const headerUserId = req.headers['x-user-id'] as string;
   const cookieMatch = req.headers.cookie?.match(/ai_movie_uid=([^;]+)/);
   const cookieUserId = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
@@ -35,20 +51,73 @@ async function getAuthenticatedUser(req: Request): Promise<{ id: string; name: s
 
   const dbUser = await Storage.getUserById(userId);
   if (dbUser) {
-    return { id: dbUser.id || userId, name: dbUser.name, email: dbUser.email };
+    const role: 'user' | 'admin' = dbUser.role === 'admin' ? 'admin' : 'user';
+    return {
+      id: dbUser.id || userId,
+      name: dbUser.name,
+      email: dbUser.email,
+      role,
+      status: (dbUser.status as any) || 'active'
+    };
   }
 
-  const userDirectory: Record<string, { id: string; name: string; email: string }> = {
-    user_batbayar: { id: 'user_batbayar', name: 'Батбаяр', email: 'batbayar@aimovie.mn' },
-    user_enkhjin: { id: 'user_enkhjin', name: 'Энхжин', email: 'enkhjin@aimovie.mn' },
-    user_temuulen: { id: 'user_temuulen', name: 'Тэмүүлэн', email: 'temuulen@aimovie.mn' }
+  const userDirectory: Record<string, AuthenticatedUser> = {
+    user_admin: { id: 'user_admin', name: 'Системийн Администратор', email: 'admin@aimovie.mn', role: 'admin', status: 'active' },
+    user_temuulen: { id: 'user_temuulen', name: 'Тэмүүлэн', email: 'temuulen@aimovie.mn', role: 'user', status: 'active' },
+    user_batbayar: { id: 'user_batbayar', name: 'Батбаяр', email: 'batbayar@aimovie.mn', role: 'user', status: 'active' },
+    user_enkhjin: { id: 'user_enkhjin', name: 'Энхжин', email: 'enkhjin@aimovie.mn', role: 'user', status: 'active' }
   };
 
   if (userDirectory[userId]) {
     return userDirectory[userId];
   }
 
-  return { id: userId, name: userId, email: `${userId}@aimovie.mn` };
+  return { id: userId, name: userId, email: `${userId}@aimovie.mn`, role: 'user', status: 'active' };
+}
+
+// Server-side authentication guard for user endpoints
+async function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Нэвтэрч орно уу.' });
+  }
+  if (user.status === 'suspended') {
+    return res.status(403).json({ error: 'ACCOUNT_SUSPENDED', message: 'Таны бүртгэл түр түдгэлзсэн байна.' });
+  }
+  (req as any).user = user;
+  next();
+}
+
+// Server-side administrator guard for Admin Panel endpoints
+async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Администратор хаягаар нэвтэрнэ үү.' });
+  }
+  if (user.role !== 'admin') {
+    return res.status(403).json({ error: 'FORBIDDEN_ADMIN_ONLY', message: 'Зөвхөн администратор хандах эрхтэй.' });
+  }
+  if (user.status === 'suspended') {
+    return res.status(403).json({ error: 'ACCOUNT_SUSPENDED', message: 'Таны администратор бүртгэл түдгэлзсэн байна.' });
+  }
+  (req as any).user = user;
+  next();
+}
+
+// In-memory sliding window rate limiter for auth endpoints
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+function checkRateLimit(ip: string, limit = 25, windowMs = 15 * 60 * 1000): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (entry.count >= limit) {
+    return false;
+  }
+  entry.count++;
+  return true;
 }
 
 // Generate base app URL
@@ -112,31 +181,27 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
   });
 });
 
-// User Registration: Sign Up with name, email, password
+// User Registration: Sign Up with Zod validation, role="user" strict enforcement, bcrypt hashing
 app.post('/api/auth/register', async (req: Request, res: Response) => {
   try {
-    const { name, email, password } = req.body;
-
-    if (!name || typeof name !== 'string' || name.trim().length < 2) {
-      return res.status(400).json({
-        error: 'INVALID_NAME',
-        message: 'Нэр хамгийн багадаа 2 тэмдэгт байх ёстой.'
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(`reg_${clientIp}`, 15)) {
+      return res.status(429).json({
+        error: 'RATE_LIMIT_EXCEEDED',
+        message: 'Хэт олон бүртгүүлэх оролдлого хийсэн байна. Түр хүлээнэ үү.'
       });
     }
 
-    if (!email || typeof email !== 'string' || !email.includes('@')) {
+    const parseResult = registerSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      const firstIssue = parseResult.error.issues[0];
       return res.status(400).json({
-        error: 'INVALID_EMAIL',
-        message: 'Имэйл хаягаа зөв оруулна уу.'
+        error: 'VALIDATION_ERROR',
+        message: firstIssue?.message || 'Мэдээллээ зөв оруулна уу.'
       });
     }
 
-    if (!password || typeof password !== 'string' || password.length < 6) {
-      return res.status(400).json({
-        error: 'INVALID_PASSWORD',
-        message: 'Нууц үг хамгийн багадаа 6 тэмдэгт байх ёстой.'
-      });
-    }
+    const { name, email, password } = parseResult.data;
 
     const existingUser = await Storage.getUserByEmail(email);
     if (existingUser) {
@@ -147,14 +212,15 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
     }
 
     const passwordHash = hashPassword(password);
+    // Mandatory security rule: newly registered users always receive 'user' role
     const newUser = await Storage.createUser({
-      name: name.trim(),
-      email: email.trim().toLowerCase(),
+      name,
+      email,
       passwordHash,
-      role: 'member'
+      role: 'user'
     });
 
-    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(newUser.id!)}; Path=/; HttpOnly; SameSite=Lax`);
+    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(newUser.id!)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
 
     return res.status(201).json({
       success: true,
@@ -162,7 +228,8 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
       user: {
         id: newUser.id,
         name: newUser.name,
-        email: newUser.email
+        email: newUser.email,
+        role: 'user'
       }
     });
   } catch (err: any) {
@@ -171,27 +238,54 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
   }
 });
 
-// User Login: Sign In with email, password
+// User Login: Sign In with Zod validation, credential check, remember me, and role redirection support
 app.post('/api/auth/login', async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({
-        error: 'MISSING_FIELDS',
-        message: 'Имэйл болон нууц үгээ оруулна уу.'
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(`login_${clientIp}`, 20)) {
+      return res.status(429).json({
+        error: 'RATE_LIMIT_EXCEEDED',
+        message: 'Хэт олон нэвтрэх оролдлого хийсэн байна. 15 минутын дараа дахин оролдоно уу.'
       });
     }
+
+    const parseResult = loginSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: parseResult.error.issues[0]?.message || 'Имэйл болон нууц үгээ оруулна уу.'
+      });
+    }
+
+    const { email, password, remember } = parseResult.data;
 
     const user = await Storage.getUserByEmail(email);
-    if (!user || !verifyPassword(password, user.passwordHash)) {
-      return res.status(401).json({
-        error: 'INVALID_CREDENTIALS',
-        message: 'Имэйл эсвэл нууц үг буруу байна.'
+    if (!user) {
+      return res.status(404).json({
+        error: 'ACCOUNT_NOT_FOUND',
+        message: 'Энэ имэйл хаягтай бүртгэл олдсонгүй.'
       });
     }
 
-    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(user.id!)}; Path=/; HttpOnly; SameSite=Lax`);
+    if (user.status === 'suspended') {
+      return res.status(403).json({
+        error: 'ACCOUNT_SUSPENDED',
+        message: 'Таны бүртгэл түр түдгэлзсэн байна. Администраторт хандана уу.'
+      });
+    }
+
+    if (!verifyPassword(password, user.passwordHash)) {
+      return res.status(401).json({
+        error: 'INCORRECT_PASSWORD',
+        message: 'Нууц үг буруу байна.'
+      });
+    }
+
+    // Update last login timestamp
+    await Storage.updateUser(user.id!, { lastLoginAt: new Date() });
+
+    const maxAge = remember ? 30 * 24 * 60 * 60 : 24 * 60 * 60; // 30 days or session day
+    res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(user.id!)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`);
 
     const subscription = await Storage.getActiveSubscription(user.id!);
 
@@ -201,13 +295,526 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       user: {
         id: user.id,
         name: user.name,
-        email: user.email
+        email: user.email,
+        role: user.role === 'admin' ? 'admin' : 'user'
       },
       subscription
     });
   } catch (err: any) {
     console.error('[Auth/Login] Error:', err);
     return res.status(500).json({ error: 'SERVER_ERROR', message: 'Нэвтрэхэд алдаа гарлаа.' });
+  }
+});
+
+// User Profile Update (Name)
+app.post('/api/auth/update-profile', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = (req as any).user as AuthenticatedUser;
+    const parseResult = updateProfileSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: parseResult.error.issues[0]?.message || 'Нэрээ зөв оруулна уу.'
+      });
+    }
+
+    const updated = await Storage.updateUser(authUser.id, { name: parseResult.data.name });
+    res.json({
+      success: true,
+      message: 'Хэрэглэгчийн мэдээлэл шинэчлэгдлээ.',
+      user: {
+        id: updated.id,
+        name: updated.name,
+        email: updated.email,
+        role: updated.role
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// User Password Change
+app.post('/api/auth/change-password', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = (req as any).user as AuthenticatedUser;
+    const parseResult = changePasswordSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: parseResult.error.issues[0]?.message || 'Мэдээллээ зөв оруулна уу.'
+      });
+    }
+
+    const { currentPassword, newPassword } = parseResult.data;
+    const dbUser = await Storage.getUserById(authUser.id);
+    if (!dbUser || !verifyPassword(currentPassword, dbUser.passwordHash)) {
+      return res.status(400).json({
+        error: 'INVALID_CURRENT_PASSWORD',
+        message: 'Одоогийн нууц үг буруу байна.'
+      });
+    }
+
+    const newHash = hashPassword(newPassword);
+    await Storage.updateUserPassword(authUser.id, newHash);
+
+    res.json({
+      success: true,
+      message: 'Нууц үг амжилттай шинэчлэгдлээ.'
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// User Sign Out: Clears session cookie
+app.post('/api/auth/logout', (_req: Request, res: Response) => {
+  res.setHeader('Set-Cookie', 'ai_movie_uid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  return res.json({ success: true, message: 'Амжилттай гарлаа.' });
+});
+
+// Quick Switch User (demo test helper)
+app.post('/api/auth/switch-user', (req: Request, res: Response) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID is required' });
+  }
+
+  res.setHeader('Set-Cookie', `ai_movie_uid=${encodeURIComponent(userId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+  res.json({ success: true, userId });
+});
+
+// =============================================================
+// ADMIN API ENDPOINTS (Protected with requireAdmin middleware)
+// =============================================================
+
+// 1. Dashboard Statistics
+app.get('/api/admin/stats', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const stats = await Storage.getDashboardStats();
+    res.json({ success: true, stats });
+  } catch (err: any) {
+    console.error('[Admin/Stats] Error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 2. Movie Management: List All
+app.get('/api/admin/movies', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const search = req.query.search as string;
+    const genre = req.query.genre as string;
+    const movies = await Storage.getAllMovies({ search, genre, publishedOnly: false });
+    res.json({ success: true, movies });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 3. Movie Management: Create
+app.post('/api/admin/movies', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const parseResult = movieSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: parseResult.error.issues[0]?.message || 'Киноны мэдээллээ зөв оруулна уу.'
+      });
+    }
+
+    const movie = await Storage.createMovie(parseResult.data as any);
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'CREATE_MOVIE',
+      target: movie.id,
+      details: `Created film: "${movie.titleMn}" (${movie.titleEn})`
+    });
+
+    res.status(201).json({ success: true, movie, message: 'Кино амжилттай нэмэгдлээ.' });
+  } catch (err: any) {
+    console.error('[Admin/CreateMovie] Error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 4. Movie Management: Update
+app.put('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const movie = await Storage.updateMovie(id, req.body);
+    if (!movie) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
+    }
+
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'UPDATE_MOVIE',
+      target: id,
+      details: `Updated film: "${movie.titleMn}" (${movie.titleEn})`
+    });
+
+    res.json({ success: true, movie, message: 'Киноны мэдээлэл амжилттай шинэчлэгдлээ.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 5. Movie Management: Delete
+app.delete('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const existing = await Storage.getMovieById(id);
+    if (!existing) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
+    }
+
+    await Storage.deleteMovie(id);
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'DELETE_MOVIE',
+      target: id,
+      details: `Deleted film: "${existing.titleMn}" (${existing.titleEn})`
+    });
+
+    res.json({ success: true, message: 'Кино амжилттай устгагдлаа.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 6. Movie Management: Toggle Publish
+app.patch('/api/admin/movies/:id/toggle-publish', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    if (!movie) return res.status(404).json({ error: 'MOVIE_NOT_FOUND' });
+
+    const updated = await Storage.updateMovie(id, { published: !movie.published });
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: updated?.published ? 'PUBLISH_MOVIE' : 'UNPUBLISH_MOVIE',
+      target: id
+    });
+
+    res.json({ success: true, movie: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 7. Movie Management: Toggle Featured
+app.patch('/api/admin/movies/:id/toggle-featured', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    if (!movie) return res.status(404).json({ error: 'MOVIE_NOT_FOUND' });
+
+    const updated = await Storage.updateMovie(id, { featured: !movie.featured });
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: updated?.featured ? 'FEATURE_MOVIE' : 'UNFEATURE_MOVIE',
+      target: id
+    });
+
+    res.json({ success: true, movie: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 8. Category Management: List All
+app.get('/api/admin/categories', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const categories = await Storage.getAllCategories();
+    res.json({ success: true, categories });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 9. Category Management: Create
+app.post('/api/admin/categories', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const parseResult = categorySchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: parseResult.error.issues[0]?.message || 'Ангиллын мэдээллээ зөв оруулна уу.'
+      });
+    }
+
+    const cat = await Storage.createCategory(parseResult.data);
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'CREATE_CATEGORY',
+      target: cat.id,
+      details: `Created category: ${cat.nameMn} (${cat.nameEn})`
+    });
+
+    res.status(201).json({ success: true, category: cat, message: 'Ангилал амжилттай үүслээ.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 10. Category Management: Update
+app.put('/api/admin/categories/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const cat = await Storage.updateCategory(id, req.body);
+    if (!cat) return res.status(404).json({ error: 'CATEGORY_NOT_FOUND' });
+
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'UPDATE_CATEGORY',
+      target: id,
+      details: `Updated category: ${cat.nameMn}`
+    });
+
+    res.json({ success: true, category: cat, message: 'Ангилал шинэчлэгдлээ.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 11. Category Management: Delete
+app.delete('/api/admin/categories/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    await Storage.deleteCategory(id);
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'DELETE_CATEGORY',
+      target: id
+    });
+
+    res.json({ success: true, message: 'Ангилал устгагдлаа.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 12. User Management: List All (Never leaks password hashes!)
+app.get('/api/admin/users', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const users = await Storage.getAllUsers();
+    const subs = await Storage.getAllSubscriptions();
+    const subMap = new Map<string, any>();
+    const now = new Date();
+    for (const s of subs) {
+      if (s.status === 'ACTIVE' && new Date(s.endDate).getTime() > now.getTime()) {
+        subMap.set(s.userId, s);
+      }
+    }
+
+    const sanitized = users.map((u) => {
+      const activeSub = subMap.get(u.id!);
+      return {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role || 'user',
+        status: u.status || 'active',
+        lastLoginAt: u.lastLoginAt,
+        createdAt: u.createdAt,
+        subscription: activeSub ? { planId: activeSub.planId, endDate: activeSub.endDate } : null
+      };
+    });
+
+    res.json({ success: true, users: sanitized });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 13. User Management: Change Role (Safeguards last admin!)
+app.patch('/api/admin/users/:id/role', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (role !== 'user' && role !== 'admin') {
+      return res.status(400).json({ error: 'INVALID_ROLE', message: 'Зөвхөн "user" эсвэл "admin" байж болно.' });
+    }
+
+    const updated = await Storage.setUserRole(id, role);
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'CHANGE_USER_ROLE',
+      target: id,
+      details: `Changed role to: ${role} for user ${updated.email}`
+    });
+
+    res.json({ success: true, user: updated, message: 'Хэрэглэгчийн эрх амжилттай өөрчлөгдлөө.' });
+  } catch (err: any) {
+    res.status(400).json({ error: 'ROLE_UPDATE_FAILED', message: err.message });
+  }
+});
+
+// 14. User Management: Change Status (Safeguards last admin!)
+app.patch('/api/admin/users/:id/status', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (status !== 'active' && status !== 'suspended') {
+      return res.status(400).json({ error: 'INVALID_STATUS', message: 'Зөвхөн "active" эсвэл "suspended" байж болно.' });
+    }
+
+    const updated = await Storage.setUserStatus(id, status);
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: status === 'suspended' ? 'SUSPEND_USER' : 'ACTIVATE_USER',
+      target: id,
+      details: `Changed status to: ${status} for user ${updated.email}`
+    });
+
+    res.json({ success: true, user: updated, message: 'Хэрэглэгчийн төлөв амжилттай шинэчлэгдлөө.' });
+  } catch (err: any) {
+    res.status(400).json({ error: 'STATUS_UPDATE_FAILED', message: err.message });
+  }
+});
+
+// 15. Payment Management: List All Payments
+app.get('/api/admin/payments', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const payments = await Storage.getAllPayments();
+    const users = await Storage.getAllUsers();
+    const userMap = new Map(users.map((u) => [u.id!, u]));
+
+    const enriched = payments.map((p) => {
+      const u = userMap.get(p.userId);
+      const plan = getPlanById(p.planId);
+      return {
+        ...p,
+        userName: u?.name || p.userId,
+        userEmail: u?.email || '',
+        planName: plan?.nameMn || p.planId
+      };
+    });
+
+    res.json({ success: true, payments: enriched });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 16. Subscription Management: List All Subscriptions
+app.get('/api/admin/subscriptions', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const subscriptions = await Storage.getAllSubscriptions();
+    const users = await Storage.getAllUsers();
+    const userMap = new Map(users.map((u) => [u.id!, u]));
+
+    const enriched = subscriptions.map((s) => {
+      const u = userMap.get(s.userId);
+      const plan = getPlanById(s.planId);
+      const now = new Date();
+      const end = new Date(s.endDate);
+      const isActive = s.status === 'ACTIVE' && end.getTime() > now.getTime();
+      return {
+        ...s,
+        userName: u?.name || s.userId,
+        userEmail: u?.email || '',
+        planName: plan?.nameMn || s.planId,
+        isActive
+      };
+    });
+
+    res.json({ success: true, subscriptions: enriched });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 17. Subscription Management: Admin Manual Adjustment (Creates Audit Log)
+app.post('/api/admin/subscriptions/adjust', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { userId, planId, durationDays = 30 } = req.body;
+
+    if (!userId || !planId) {
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'Хэрэглэгч болон багц сонгоно уу.' });
+    }
+
+    const sub = await Storage.adminAdjustSubscription({
+      userId,
+      planId,
+      durationDays: Number(durationDays),
+      adminId: admin.id,
+      adminEmail: admin.email
+    });
+
+    res.json({ success: true, subscription: sub, message: 'Гишүүнчлэлийг амжилттай тохирууллаа.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 18. Audit Logs: List
+app.get('/api/admin/audit-logs', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const logs = await Storage.getAuditLogs(100);
+    res.json({ success: true, logs });
+  } catch (err: any) {
+    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 19. Movie Image Upload: Accepts Base64 data and writes to /public/uploads/
+app.post('/api/admin/upload', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { dataUrl, filename = 'image.jpg' } = req.body;
+    if (!dataUrl || typeof dataUrl !== 'string') {
+      return res.status(400).json({ error: 'INVALID_IMAGE', message: 'Зургийн өгөгдөл дутуу байна.' });
+    }
+
+    const matches = dataUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return res.status(400).json({ error: 'INVALID_BASE64', message: 'Хүчингүй зургийн формат.' });
+    }
+
+    const buffer = Buffer.from(matches[2], 'base64');
+    if (buffer.length > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: 'FILE_TOO_LARGE', message: 'Зургийн хэмжээ 5MB-аас хэтрэхгүй байх ёстой.' });
+    }
+
+    const uploadsDir = path.join(__dirname, 'public', 'uploads');
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+
+    const ext = path.extname(filename) || '.jpg';
+    const safeName = `img_${Date.now()}_${crypto.randomBytes(3).toString('hex')}${ext}`;
+    const filePath = path.join(uploadsDir, safeName);
+
+    fs.writeFileSync(filePath, buffer);
+    const publicUrl = `/uploads/${safeName}`;
+
+    res.json({ success: true, url: publicUrl, message: 'Зураг амжилттай хуулагдлаа.' });
+  } catch (err: any) {
+    console.error('[Admin/Upload] Error:', err);
+    res.status(500).json({ error: 'UPLOAD_FAILED', message: err.message });
   }
 });
 
@@ -723,22 +1330,40 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
 // -------------------------------------------------------------
 // 8. Movies & Protected Streaming
 // -------------------------------------------------------------
-app.get('/api/movies', (req: Request, res: Response) => {
-  const publicList = MOVIES.map((m) => {
-    const { videoSource, ...rest } = m;
-    return rest;
-  });
-  res.json({ movies: publicList });
+app.get('/api/movies', async (_req: Request, res: Response) => {
+  try {
+    const list = await Storage.getAllMovies({ publishedOnly: true });
+    const publicList = list.map((m) => {
+      const { videoSource, videoUrl, ...rest } = m as any;
+      return rest;
+    });
+    res.json({ movies: publicList });
+  } catch (err: any) {
+    const fallbackList = MOVIES.map((m) => {
+      const { videoSource, ...rest } = m;
+      return rest;
+    });
+    res.json({ movies: fallbackList });
+  }
 });
 
 // Stream endpoint with server-side subscription check
 app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
   const { id } = req.params;
-  const movie = getMovieById(id);
+  let movie = await Storage.getMovieById(id);
+  if (!movie) {
+    const legacy = getMovieById(id);
+    if (legacy) {
+      movie = legacy as any;
+    }
+  }
 
   if (!movie) {
     return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
   }
+
+  // Increment views count asynchronously
+  Storage.incrementMovieViews(id).catch(() => {});
 
   const user = await getAuthenticatedUser(req);
 
@@ -770,9 +1395,9 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
   res.json({
     authorized: true,
     movieId: movie.id,
-    titleMn: movie.titleMn,
+    titleMn: movie.titleMn || movie.title?.mn,
     quality: movie.quality,
-    streamUrl: movie.videoSource,
+    streamUrl: (movie as any).videoSource || (movie as any).videoUrl,
     expiresAt,
     token: signedToken
   });

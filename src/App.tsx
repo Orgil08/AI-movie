@@ -18,6 +18,12 @@ import { WireDocsGuideModal } from './components/WireDocsGuideModal.js';
 import { AuthModal } from './components/AuthModal.js';
 import { Footer } from './components/Footer.js';
 import { SEOHead } from './components/SEOHead.js';
+import { ContinueWatchingRow } from './components/ContinueWatchingRow.js';
+import { LoginPage } from './components/LoginPage.js';
+import { RegisterPage } from './components/RegisterPage.js';
+import { ProfilePage } from './components/ProfilePage.js';
+import { AdminPanel } from './components/AdminPanel.js';
+import { WatchProgress, getWatchProgressList, removeWatchProgress, getWatchProgressForMovie } from './utils/watchProgress.js';
 import { MOVIES, Movie } from './data/movies.js';
 
 function AppContent() {
@@ -25,15 +31,28 @@ function AppContent() {
   const tHome = useTranslations('HomePage');
 
   const [currentTab, setCurrentTab] = useState<string>('home');
-  const [currentUser, setCurrentUser] = useState<{ id: string; name: string; email: string } | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ id: string; name: string; email: string; role?: 'user' | 'admin' } | null>(null);
+  const [loginBannerMessage, setLoginBannerMessage] = useState<string | null>(null);
   const [subscription, setSubscription] = useState<any>(null);
   const [activeMovieForPlayer, setActiveMovieForPlayer] = useState<Movie | null>(null);
+  const [playerInitialTime, setPlayerInitialTime] = useState<number>(0);
   const [selectedMovieForDetail, setSelectedMovieForDetail] = useState<Movie | null>(null);
   const [selectedOrderNumber, setSelectedOrderNumber] = useState<string>('');
   const [loadingPlanId, setLoadingPlanId] = useState<string | null>(null);
   const [docsModalOpen, setDocsModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [myListIds, setMyListIds] = useState<string[]>(['ai-nomad-2099', 'quantum-shaman']);
+  const [watchProgressList, setWatchProgressList] = useState<WatchProgress[]>(() => getWatchProgressList());
+
+  const handlePlayMovie = (movie: Movie, initialTime?: number) => {
+    let time = initialTime;
+    if (time === undefined) {
+      const existing = getWatchProgressForMovie(movie.id);
+      time = existing ? existing.currentTime : 0;
+    }
+    setPlayerInitialTime(time);
+    setActiveMovieForPlayer(movie);
+  };
 
   // Authentication Modal state
   const [authModalOpen, setAuthModalOpen] = useState(false);
@@ -65,6 +84,18 @@ function AppContent() {
       setCurrentTab('pricing');
     } else if (cleanPath.startsWith('/movies')) {
       setCurrentTab('movies');
+    } else if (cleanPath.startsWith('/login')) {
+      setCurrentTab('login');
+    } else if (cleanPath.startsWith('/register')) {
+      setCurrentTab('register');
+    } else if (cleanPath.startsWith('/admin')) {
+      setCurrentTab('admin');
+    } else if (cleanPath.startsWith('/account/subscription') || cleanPath.startsWith('/subscription')) {
+      setCurrentTab('subscription');
+    } else if (cleanPath.startsWith('/account/payments') || cleanPath.startsWith('/payments')) {
+      setCurrentTab('payments');
+    } else if (cleanPath.startsWith('/account') || cleanPath.startsWith('/profile')) {
+      setCurrentTab('account');
     } else if (cleanPath.startsWith('/movie/')) {
       const slug = cleanPath.replace('/movie/', '').split('/')[0];
       const match = MOVIES.find((m) => m.id === slug);
@@ -78,10 +109,6 @@ function AppContent() {
         if (orderId && orderId !== 'checkout') setSelectedOrderNumber(orderId);
       }
       setCurrentTab('checkout');
-    } else if (cleanPath.startsWith('/account/subscription') || cleanPath.startsWith('/subscription')) {
-      setCurrentTab('subscription');
-    } else if (cleanPath.startsWith('/account/payments') || cleanPath.startsWith('/payments')) {
-      setCurrentTab('payments');
     }
 
     fetchUserAndSubscription();
@@ -97,6 +124,10 @@ function AppContent() {
     else if (newTab === 'pricing') cleanPath = '/pricing';
     else if (newTab === 'subscription') cleanPath = '/account/subscription';
     else if (newTab === 'payments') cleanPath = '/account/payments';
+    else if (newTab === 'account') cleanPath = '/account';
+    else if (newTab === 'login') cleanPath = '/login';
+    else if (newTab === 'register') cleanPath = '/register';
+    else if (newTab === 'admin') cleanPath = '/admin';
     else if (newTab === 'checkout' && selectedOrderNumber) cleanPath = `/checkout/${selectedOrderNumber}`;
     else if (newTab === 'payment-success' && selectedOrderNumber) cleanPath = `/payment/success?order=${selectedOrderNumber}`;
 
@@ -106,7 +137,12 @@ function AppContent() {
 
   const fetchUserAndSubscription = async () => {
     try {
-      const res = await fetch('/api/auth/me');
+      const storedUid = typeof window !== 'undefined' ? localStorage.getItem('ai_movie_uid') : null;
+      const headers: Record<string, string> = {};
+      if (storedUid) {
+        headers['x-user-id'] = storedUid;
+      }
+      const res = await fetch('/api/auth/me', { headers });
       if (res.ok) {
         const data = await res.json();
         setCurrentUser(data.user || null);
@@ -119,9 +155,15 @@ function AppContent() {
 
   const handleSwitchUser = async (userId: string) => {
     try {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('ai_movie_uid', userId);
+      }
       const res = await fetch('/api/auth/switch-user', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': userId
+        },
         body: JSON.stringify({ userId })
       });
       if (res.ok) {
@@ -134,10 +176,13 @@ function AppContent() {
 
   const handleSignOut = async () => {
     try {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('ai_movie_uid');
+      }
       await fetch('/api/auth/logout', { method: 'POST' });
       setCurrentUser(null);
       setSubscription(null);
-      if (currentTab === 'subscription' || currentTab === 'payments') {
+      if (currentTab === 'subscription' || currentTab === 'payments' || currentTab === 'account' || currentTab === 'admin') {
         updateTabAndUrl('home');
       }
     } catch (err) {
@@ -150,16 +195,39 @@ function AppContent() {
     setAuthModalOpen(true);
   };
 
-  const handleAuthSuccess = async (user: { id: string; name: string; email: string }) => {
+  const handleLoginSuccess = async (user: { id: string; name: string; email: string; role?: 'user' | 'admin' }) => {
+    if (typeof window !== 'undefined' && user?.id) {
+      localStorage.setItem('ai_movie_uid', user.id);
+    }
     setCurrentUser(user);
+    setLoginBannerMessage(null);
     await fetchUserAndSubscription();
 
-    // If there was an attempted subscription before signing in, resume it now
-    if (pendingPlanAfterAuth) {
+    // Login redirection rule:
+    // IF user.role === "admin": Redirect to /admin
+    // IF user.role === "user": Redirect to homepage or requested protected page
+    if (user.role === 'admin') {
+      updateTabAndUrl('admin');
+    } else if (pendingPlanAfterAuth) {
       const { planId, paymentMethod } = pendingPlanAfterAuth;
       setPendingPlanAfterAuth(null);
       handleSelectPlan(planId, paymentMethod);
+    } else {
+      updateTabAndUrl('home');
     }
+  };
+
+  const handleRegisterSuccess = (registeredEmail: string) => {
+    setLoginBannerMessage(
+      locale === 'en'
+        ? `Account registered successfully! Please sign in with ${registeredEmail}.`
+        : `Бүртгэл амжилттай үүслээ! ${registeredEmail} хаягаар нэвтэрнэ үү.`
+    );
+    updateTabAndUrl('login');
+  };
+
+  const handleAuthSuccess = async (user: { id: string; name: string; email: string; role?: 'user' | 'admin' }) => {
+    await handleLoginSuccess(user);
   };
 
   const handleSelectPlan = async (planId: string, paymentMethod?: 'wire_qpay' | 'bank_transfer') => {
@@ -226,23 +294,25 @@ function AppContent() {
       />
 
       {/* Streamline Navigation Bar */}
-      <Navbar
-        currentTab={currentTab}
-        setCurrentTab={updateTabAndUrl}
-        currentUser={currentUser}
-        subscription={subscription}
-        onSwitchUser={handleSwitchUser}
-        onOpenDocs={() => setDocsModalOpen(true)}
-        onOpenAuth={handleOpenAuth}
-        onSignOut={handleSignOut}
-        searchQuery={searchQuery}
-        setSearchQuery={(q) => {
-          setSearchQuery(q);
-          if (q.trim() && currentTab !== 'movies') {
-            updateTabAndUrl('movies');
-          }
-        }}
-      />
+      {!(currentTab === 'admin' && currentUser?.role === 'admin') && (
+        <Navbar
+          currentTab={currentTab}
+          setCurrentTab={updateTabAndUrl}
+          currentUser={currentUser}
+          subscription={subscription}
+          onSwitchUser={handleSwitchUser}
+          onOpenDocs={() => setDocsModalOpen(true)}
+          onOpenAuth={handleOpenAuth}
+          onSignOut={handleSignOut}
+          searchQuery={searchQuery}
+          setSearchQuery={(q) => {
+            setSearchQuery(q);
+            if (q.trim() && currentTab !== 'movies') {
+              updateTabAndUrl('movies');
+            }
+          }}
+        />
+      )}
 
       {/* Main Content Area */}
       <main className="flex-1">
@@ -251,19 +321,32 @@ function AppContent() {
             {/* Streamline Cinematic Hero Banner */}
             <HeroBanner
               movie={featuredMovie}
-              onPlay={(m) => setActiveMovieForPlayer(m)}
+              onPlay={(m) => handlePlayMovie(m)}
               onSelect={(m) => setSelectedMovieForDetail(m)}
               hasActiveSubscription={hasActiveSub}
             />
 
             {/* Movie Category Grids */}
             <div className="-mt-10 relative z-20 space-y-4 pb-12">
+              {/* Continue Watching Row (Partially watched movies) */}
+              <ContinueWatchingRow
+                progressList={watchProgressList}
+                hasActiveSubscription={hasActiveSub}
+                onResume={(m, initialTime) => handlePlayMovie(m, initialTime)}
+                onSelect={(m) => setSelectedMovieForDetail(m)}
+                onRemove={(movieId) => {
+                  const updated = removeWatchProgress(movieId);
+                  setWatchProgressList(updated);
+                }}
+                onOpenPricing={() => updateTabAndUrl('pricing')}
+              />
+
               <MovieRow
                 title={tHome('trending')}
                 subtitle={tHome('trendingSub')}
                 movies={trendingMovies}
                 hasActiveSubscription={hasActiveSub}
-                onPlay={(m) => setActiveMovieForPlayer(m)}
+                onPlay={(m) => handlePlayMovie(m)}
                 onSelect={(m) => setSelectedMovieForDetail(m)}
                 onOpenPricing={() => updateTabAndUrl('pricing')}
               />
@@ -273,7 +356,7 @@ function AppContent() {
                 subtitle={tHome('top10Sub')}
                 movies={top10Movies}
                 hasActiveSubscription={hasActiveSub}
-                onPlay={(m) => setActiveMovieForPlayer(m)}
+                onPlay={(m) => handlePlayMovie(m)}
                 onSelect={(m) => setSelectedMovieForDetail(m)}
                 onOpenPricing={() => updateTabAndUrl('pricing')}
               />
@@ -283,7 +366,7 @@ function AppContent() {
                 subtitle={locale === 'en' ? 'Futuristic realities, quantum consciousness, and neural synthetics' : 'Ирээдүйн ертөнц, квант технологи, хиймэл оюун'}
                 movies={sciFiMovies}
                 hasActiveSubscription={hasActiveSub}
-                onPlay={(m) => setActiveMovieForPlayer(m)}
+                onPlay={(m) => handlePlayMovie(m)}
                 onSelect={(m) => setSelectedMovieForDetail(m)}
                 onOpenPricing={() => updateTabAndUrl('pricing')}
               />
@@ -296,7 +379,7 @@ function AppContent() {
 
         {currentTab === 'movies' && (
           <MovieCatalogueView
-            onPlay={(m) => setActiveMovieForPlayer(m)}
+            onPlay={(m) => handlePlayMovie(m)}
             onSelect={(m) => setSelectedMovieForDetail(m)}
             hasActiveSubscription={hasActiveSub}
             onOpenPricing={() => updateTabAndUrl('pricing')}
@@ -387,6 +470,97 @@ function AppContent() {
             </div>
           )
         )}
+
+        {currentTab === 'login' && (
+          <LoginPage
+            onSuccess={handleLoginSuccess}
+            onNavigateToRegister={() => updateTabAndUrl('register')}
+            onNavigateToHome={() => updateTabAndUrl('home')}
+            initialMessage={loginBannerMessage}
+          />
+        )}
+
+        {currentTab === 'register' && (
+          <RegisterPage
+            onSuccess={handleLoginSuccess}
+            onNavigateToLogin={() => {
+              setLoginBannerMessage(null);
+              updateTabAndUrl('login');
+            }}
+            onNavigateToHome={() => updateTabAndUrl('home')}
+          />
+        )}
+
+        {currentTab === 'account' && (
+          currentUser ? (
+            <ProfilePage
+              user={currentUser}
+              subscription={subscription}
+              onSignOut={handleSignOut}
+              onNavigateToPricing={() => updateTabAndUrl('pricing')}
+              onNavigateToAdmin={() => updateTabAndUrl('admin')}
+              onUserUpdated={(updated) => {
+                setCurrentUser(updated);
+                fetchUserAndSubscription();
+              }}
+            />
+          ) : (
+            <div className="max-w-md mx-auto my-20 p-8 rounded-2xl bg-[#0f172a] border border-white/10 text-center space-y-4">
+              <h3 className="text-xl font-bold text-white">
+                {locale === 'en' ? 'Sign in to view account' : 'Хувийн хуудсаа харахын тулд нэвтэрнэ үү'}
+              </h3>
+              <p className="text-xs text-slate-400">
+                {locale === 'en'
+                  ? 'Manage your personal profile, update password, and view subscription details.'
+                  : 'Хувийн мэдээллээ шинэчлэх, нууц үгээ солих болон гишүүнчлэлээ удирдахын тулд нэвтэрнэ үү.'}
+              </p>
+              <button
+                onClick={() => updateTabAndUrl('login')}
+                className="px-6 py-2.5 bg-[#e5a93c] hover:bg-amber-400 text-black text-xs font-bold rounded-xl transition cursor-pointer"
+              >
+                {locale === 'en' ? 'Sign In Now' : 'Одоо нэвтрэх'}
+              </button>
+            </div>
+          )
+        )}
+
+        {currentTab === 'admin' && (
+          currentUser && currentUser.role === 'admin' ? (
+            <AdminPanel
+              currentUser={currentUser}
+              onBackToHome={() => updateTabAndUrl('home')}
+              onSignOut={handleSignOut}
+            />
+          ) : (
+            <div className="max-w-md mx-auto my-24 p-8 rounded-2xl bg-[#0f172a] border border-rose-500/30 text-center space-y-4">
+              <div className="w-12 h-12 rounded-full bg-rose-500/10 text-rose-400 flex items-center justify-center mx-auto text-xl font-bold">
+                !
+              </div>
+              <h3 className="text-xl font-bold text-white">
+                {locale === 'en' ? 'Administrator Access Required' : 'Администраторын эрх шаардлагатай'}
+              </h3>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                {locale === 'en'
+                  ? 'This area is restricted to administrators only. Please sign in with an authorized admin account.'
+                  : 'Энэ хэсэгт зөвхөн админ эрхтэй хэрэглэгч нэвтрэх боломжтой. Админ хаягаар нэвтэрнэ үү.'}
+              </p>
+              <div className="flex items-center justify-center gap-3 pt-2">
+                <button
+                  onClick={() => updateTabAndUrl('login')}
+                  className="px-5 py-2.5 bg-[#e50914] hover:bg-rose-600 text-white text-xs font-bold rounded-xl transition cursor-pointer shadow-lg shadow-rose-950/50"
+                >
+                  {locale === 'en' ? 'Sign In as Admin' : 'Админаар нэвтрэх'}
+                </button>
+                <button
+                  onClick={() => updateTabAndUrl('home')}
+                  className="px-5 py-2.5 bg-white/10 hover:bg-white/20 text-white text-xs font-medium rounded-xl transition cursor-pointer"
+                >
+                  {locale === 'en' ? 'Back to Home' : 'Нүүр хуудас'}
+                </button>
+              </div>
+            </div>
+          )
+        )}
       </main>
 
       {/* Streamline Title Detail Modal */}
@@ -396,7 +570,7 @@ function AppContent() {
           onClose={() => setSelectedMovieForDetail(null)}
           onPlay={(m) => {
             setSelectedMovieForDetail(null);
-            setActiveMovieForPlayer(m);
+            handlePlayMovie(m);
           }}
           hasActiveSubscription={hasActiveSub}
           onOpenPricing={() => {
@@ -411,9 +585,18 @@ function AppContent() {
       {/* Movie Player & Access Control Modal */}
       <MoviePlayerModal
         movie={activeMovieForPlayer}
-        onClose={() => setActiveMovieForPlayer(null)}
+        initialTime={playerInitialTime}
+        onClose={() => {
+          setActiveMovieForPlayer(null);
+          setPlayerInitialTime(0);
+          setWatchProgressList(getWatchProgressList());
+        }}
+        onProgressUpdate={() => {
+          setWatchProgressList(getWatchProgressList());
+        }}
         onGoToPricing={() => {
           setActiveMovieForPlayer(null);
+          setPlayerInitialTime(0);
           updateTabAndUrl('pricing');
         }}
         hasActiveSubscription={hasActiveSub}
@@ -431,10 +614,12 @@ function AppContent() {
       />
 
       {/* Streamline Cinema Footer */}
-      <Footer
-        onNavClick={updateTabAndUrl}
-        onOpenDocs={() => setDocsModalOpen(true)}
-      />
+      {!(currentTab === 'admin' && currentUser?.role === 'admin') && (
+        <Footer
+          onNavClick={updateTabAndUrl}
+          onOpenDocs={() => setDocsModalOpen(true)}
+        />
+      )}
     </div>
   );
 }
