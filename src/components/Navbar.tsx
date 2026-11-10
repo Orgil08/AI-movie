@@ -8,7 +8,7 @@ interface NavbarProps {
   setCurrentTab: (tab: string) => void;
   currentUser: { id: string; name: string; email: string; role?: 'user' | 'admin' } | null;
   subscription: any;
-  onSwitchUser: (userId: string) => void;
+  onSwitchUser?: (userId: string) => void;
   onOpenDocs: () => void;
   onOpenAuth: (mode?: 'signin' | 'signup') => void;
   onSignOut: () => void;
@@ -21,7 +21,6 @@ export const Navbar: React.FC<NavbarProps> = ({
   setCurrentTab,
   currentUser,
   subscription,
-  onSwitchUser,
   onOpenDocs,
   onOpenAuth,
   onSignOut,
@@ -33,27 +32,6 @@ export const Navbar: React.FC<NavbarProps> = ({
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-
-  const demoUsers = [
-    {
-      id: 'user_batbayar',
-      name: 'Батбаяр',
-      roleMn: 'Шинэ зочин (Эрхгүй)',
-      roleEn: 'Guest (Unsubscribed)'
-    },
-    {
-      id: 'user_enkhjin',
-      name: 'Энхжин',
-      roleMn: 'Стандарт гишүүн',
-      roleEn: 'Standard Member'
-    },
-    {
-      id: 'user_temuulen',
-      name: 'Тэмүүлэн',
-      roleMn: 'Премиум 4K гишүүн',
-      roleEn: 'Premium 4K VIP'
-    }
-  ];
 
   const handleNavClick = (tab: string) => {
     setCurrentTab(tab);
@@ -228,32 +206,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                     </div>
                   </div>
 
-                  <div className="py-1">
-                    <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-slate-500 font-bold">
-                      {t('switchUser')}
-                    </div>
-                    {demoUsers.map((u) => (
-                      <button
-                        key={u.id}
-                        onClick={() => {
-                          onSwitchUser(u.id);
-                          setUserMenuOpen(false);
-                        }}
-                        className={`w-full text-left px-3 py-1.5 rounded-md text-xs transition flex flex-col cursor-pointer ${
-                          currentUser.id === u.id
-                            ? 'bg-[#e5a93c]/15 text-[#e5a93c] font-semibold'
-                            : 'text-slate-300 hover:bg-white/5 hover:text-white'
-                        }`}
-                      >
-                        <span>{u.name}</span>
-                        <span className="text-[10px] text-slate-500">
-                          {locale === 'en' ? u.roleEn : u.roleMn}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="pt-1 mt-1 border-t border-white/10 space-y-0.5">
+                  <div className="pt-1 mt-1 space-y-0.5">
                     {currentUser.role === 'admin' && (
                       <button
                         onClick={() => {

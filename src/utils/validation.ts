@@ -3,27 +3,31 @@ import { z } from 'zod';
 export const registerSchema = z
   .object({
     name: z
-      .string()
+      .string({ error: 'Нэрээ оруулна уу.' })
       .trim()
       .min(2, { message: 'Нэр хамгийн багадаа 2 тэмдэгт байх ёстой.' })
       .max(60, { message: 'Нэр 60 тэмдэгтээс хэтрэхгүй байх ёстой.' }),
     email: z
-      .string()
+      .string({ error: 'Имэйл хаягаа оруулна уу.' })
       .trim()
       .toLowerCase()
       .email({ message: 'Имэйл хаягаа зөв оруулна уу (жишээ: user@example.com).' }),
     password: z
-      .string()
+      .string({ error: 'Нууц үгээ оруулна уу.' })
       .min(8, { message: 'Нууц үг хамгийн багадаа 8 тэмдэгт байх ёстой.' })
       .max(100, { message: 'Нууц үг хэт урт байна.' }),
     confirmPassword: z
       .string()
-      .min(8, { message: 'Нууц үг хамгийн багадаа 8 тэмдэгт байх ёстой.' }),
-    terms: z.boolean().refine((val) => val === true, {
-      message: 'Үйлчилгээний нөхцөлийг зөвшөөрнө үү.'
-    })
+      .optional(),
+    terms: z
+      .boolean()
+      .optional()
+      .default(true)
+      .refine((val) => val === true, {
+        message: 'Үйлчилгээний нөхцөлийг зөвшөөрнө үү.'
+      })
   })
-  .refine((data) => data.password === data.confirmPassword, {
+  .refine((data) => !data.confirmPassword || data.password === data.confirmPassword, {
     message: 'Нууц үгүүд таарахгүй байна.',
     path: ['confirmPassword']
   });

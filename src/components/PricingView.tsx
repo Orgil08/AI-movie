@@ -152,14 +152,14 @@ export const PricingView: React.FC<PricingViewProps> = ({
               }`}
             >
               {plan.popular && (
-                <div className="absolute -top-3 left-1/2 -translate-x-1/2">
-                  <span className="px-3.5 py-0.5 rounded-md text-xs font-black uppercase tracking-wider bg-[#e5a93c] text-black shadow-lg">
+                <div className="absolute -top-3.5 left-1/2 -translate-x-1/2 z-10 w-max max-w-[90%] text-center">
+                  <span className="px-4 py-1 rounded-full text-[11px] font-black uppercase tracking-wider bg-gradient-to-r from-amber-400 to-[#e5a93c] text-black shadow-lg shadow-amber-950/60 whitespace-nowrap border border-amber-300/40">
                     {t('mostPopular')}
                   </span>
                 </div>
               )}
 
-              <div className="p-6 sm:p-8">
+              <div className={`p-6 sm:p-8 ${plan.popular ? 'pt-8 sm:pt-9' : ''}`}>
                 {/* Plan Header */}
                 <div className="flex items-start justify-between">
                   <div>

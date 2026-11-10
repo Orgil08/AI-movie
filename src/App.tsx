@@ -148,27 +148,6 @@ function AppContent() {
     }
   };
 
-  const handleSwitchUser = async (userId: string) => {
-    try {
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('ai_movie_uid', userId);
-      }
-      const res = await fetch('/api/auth/switch-user', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ userId })
-      });
-      if (res.ok) {
-        await fetchUserAndSubscription();
-      }
-    } catch (err) {
-      console.error('Failed to switch user', err);
-    }
-  };
-
   const handleSignOut = async () => {
     try {
       if (typeof window !== 'undefined') {
@@ -295,7 +274,6 @@ function AppContent() {
           setCurrentTab={updateTabAndUrl}
           currentUser={currentUser}
           subscription={subscription}
-          onSwitchUser={handleSwitchUser}
           onOpenDocs={() => setDocsModalOpen(true)}
           onOpenAuth={handleOpenAuth}
           onSignOut={handleSignOut}

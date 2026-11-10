@@ -7,6 +7,7 @@ import {
   IMovie,
   ICategory,
   IAuditLog,
+  IPasswordResetToken,
   UserModel,
   PaymentModel,
   SubscriptionModel,
@@ -14,9 +15,11 @@ import {
   MovieModel,
   CategoryModel,
   AuditLogModel,
+  PasswordResetTokenModel,
   PaymentStatus,
   SubscriptionStatus
 } from './models.js';
+import crypto from 'node:crypto';
 import { hashPassword } from '../utils/crypto.js';
 import { MOVIES } from '../data/movies.js';
 
@@ -86,6 +89,7 @@ class MemoryDatabase {
   public movies: Map<string, IMovie> = new Map();
   public categories: Map<string, ICategory> = new Map();
   public auditLogs: IAuditLog[] = [];
+  public passwordResetTokens: Map<string, IPasswordResetToken> = new Map();
 
   constructor() {
     // Demo accounts are useful in local development and tests only.
@@ -373,13 +377,14 @@ export const Storage = {
   async updatePaymentStatus(
     orderNumber: string,
     status: PaymentStatus,
-    extra?: { paidAt?: Date; wireChargeId?: string; bankSenderName?: string; bankTransferRef?: string }
+    extra?: { paidAt?: Date; wireChargeId?: string; wireCheckoutSessionId?: string; bankSenderName?: string; bankTransferRef?: string }
   ): Promise<IPayment | null> {
     const isMongo = await connectDB();
     if (isMongo) {
       const updateData: any = { status };
       if (extra?.paidAt) updateData.paidAt = extra.paidAt;
       if (extra?.wireChargeId) updateData.wireChargeId = extra.wireChargeId;
+      if (extra?.wireCheckoutSessionId) updateData.wireCheckoutSessionId = extra.wireCheckoutSessionId;
       if (extra?.bankSenderName) updateData.bankSenderName = extra.bankSenderName;
       if (extra?.bankTransferRef) updateData.bankTransferRef = extra.bankTransferRef;
 
@@ -412,6 +417,7 @@ export const Storage = {
           status,
           paidAt: extra?.paidAt !== undefined ? extra.paidAt : p.paidAt,
           wireChargeId: extra?.wireChargeId || p.wireChargeId,
+          wireCheckoutSessionId: extra?.wireCheckoutSessionId || p.wireCheckoutSessionId,
           bankSenderName: extra?.bankSenderName || p.bankSenderName,
           bankTransferRef: extra?.bankTransferRef || p.bankTransferRef
         };
@@ -1438,6 +1444,49 @@ export const Storage = {
     return memDb.auditLogs.slice(0, limit);
   },
 
+  async getAllWebhookEvents(): Promise<IWireWebhookEvent[]> {
+    const isMongo = await connectDB();
+    if (isMongo) {
+      try {
+        const docs = await WireWebhookEventModel.find().sort({ receivedAt: -1 }).limit(100).lean();
+        if (docs.length > 0) {
+          return docs.map((d: any) => ({
+            id: d._id?.toString(),
+            eventId: d.eventId,
+            eventType: d.eventType,
+            paymentIntentId: d.paymentIntentId,
+            processed: d.processed,
+            receivedAt: d.receivedAt || (d as any).createdAt || new Date(),
+            processedAt: d.processedAt,
+            payloadSummary: d.payloadSummary
+          }));
+        }
+      } catch {}
+    }
+    return Array.from(memDb.webhookEvents.values()).sort(
+      (a, b) => b.receivedAt.getTime() - a.receivedAt.getTime()
+    );
+  },
+
+  async getWebsiteSettings(): Promise<any> {
+    return {
+      maintenanceMode: false,
+      allowRegistrations: true,
+      streamingQualityDefault: '1080p',
+      bankTransferEnabled: true,
+      qpayEnabled: true,
+      announcementMn: 'AI Кино платформд тавтай морилно уу.',
+      announcementEn: 'Welcome to AI Movie streaming platform.'
+    };
+  },
+
+  async updateWebsiteSettings(settings: any): Promise<any> {
+    return {
+      ...settings,
+      updatedAt: new Date()
+    };
+  },
+
   // -------------------------------------------------------------
   // Dashboard Analytics
   // -------------------------------------------------------------
@@ -1509,6 +1558,130 @@ export const Storage = {
       monthlyRevenueData,
       subscriptionDistribution: subDist
     };
+  },
+
+  // -------------------------------------------------------------
+  // Password Reset Token Methods (Secure token stored in MongoDB)
+  // -------------------------------------------------------------
+  async createPasswordResetToken(email: string): Promise<{ token: string; expiresAt: Date; userId: string; email: string } | null> {
+    const user = await this.getUserByEmail(email);
+    if (!user || !user.id) return null;
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour validity
+
+    const isMongo = await connectDB();
+    if (isMongo) {
+      try {
+        await PasswordResetTokenModel.create({
+          userId: user.id,
+          email: user.email,
+          token,
+          expiresAt,
+          used: false
+        });
+      } catch (err) {
+        console.warn('[Storage.createPasswordResetToken] Mongo create error:', (err as Error).message);
+      }
+    }
+
+    // Also store in memory cache for immediate access / tests
+    memDb.passwordResetTokens.set(token, {
+      id: `prt_${Date.now()}`,
+      userId: user.id,
+      email: user.email,
+      token,
+      expiresAt,
+      used: false,
+      createdAt: new Date()
+    });
+
+    return {
+      token,
+      expiresAt,
+      userId: user.id,
+      email: user.email
+    };
+  },
+
+  async verifyPasswordResetToken(token: string): Promise<{ valid: boolean; email?: string; userId?: string; message?: string }> {
+    if (!token || typeof token !== 'string' || token.trim() === '') {
+      return { valid: false, message: 'Нууц үг сэргээх токен дутуу байна.' };
+    }
+
+    let record: IPasswordResetToken | null = null;
+    const isMongo = await connectDB();
+    if (isMongo) {
+      try {
+        const doc = await PasswordResetTokenModel.findOne({ token }).lean();
+        if (doc) {
+          record = {
+            id: (doc as any)._id?.toString() || (doc as any).id,
+            userId: (doc as any).userId,
+            email: (doc as any).email,
+            token: (doc as any).token,
+            expiresAt: new Date((doc as any).expiresAt),
+            used: (doc as any).used,
+            createdAt: new Date((doc as any).createdAt || Date.now())
+          };
+        }
+      } catch (err) {
+        console.warn('[Storage.verifyPasswordResetToken] Mongo find error:', (err as Error).message);
+      }
+    }
+
+    if (!record) {
+      record = memDb.passwordResetTokens.get(token) || null;
+    }
+
+    if (!record) {
+      return { valid: false, message: 'Нууц үг сэргээх холбоос олдсонгүй эсвэл хүчингүй байна.' };
+    }
+
+    if (record.used) {
+      return { valid: false, message: 'Энэхүү холбоосыг өмнө нь ашигласан байна. Дахин шинэ хүсэлт илгээнэ үү.' };
+    }
+
+    if (new Date(record.expiresAt).getTime() < Date.now()) {
+      return { valid: false, message: 'Нууц үг сэргээх холбоосын хүчинтэй хугацаа (1 цаг) дууссан байна.' };
+    }
+
+    return {
+      valid: true,
+      email: record.email,
+      userId: record.userId
+    };
+  },
+
+  async resetPasswordWithToken(token: string, newPassword: string): Promise<{ success: boolean; message: string }> {
+    const verification = await this.verifyPasswordResetToken(token);
+    if (!verification.valid || !verification.userId) {
+      return { success: false, message: verification.message || 'Хүчингүй хүсэлт.' };
+    }
+
+    const newHash = hashPassword(newPassword);
+    const updated = await this.updateUserPassword(verification.userId, newHash);
+    if (!updated) {
+      return { success: false, message: 'Хэрэглэгчийн нууц үгийг шинэчлэхэд алдаа гарлаа.' };
+    }
+
+    // Mark token as used
+    const isMongo = await connectDB();
+    if (isMongo) {
+      try {
+        await PasswordResetTokenModel.updateOne({ token }, { $set: { used: true } });
+      } catch (err) {
+        console.warn('[Storage.resetPasswordWithToken] Mongo update error:', (err as Error).message);
+      }
+    }
+
+    const mem = memDb.passwordResetTokens.get(token);
+    if (mem) {
+      mem.used = true;
+      memDb.passwordResetTokens.set(token, mem);
+    }
+
+    return { success: true, message: 'Нууц үг амжилттай шинэчлэгдлээ.' };
   }
 };
 

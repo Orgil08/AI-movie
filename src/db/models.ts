@@ -47,6 +47,16 @@ export interface IWireWebhookEvent {
   payloadSummary?: string;
 }
 
+export interface IPasswordResetToken {
+  id?: string;
+  userId: string;
+  email: string;
+  token: string;
+  expiresAt: Date;
+  used: boolean;
+  createdAt: Date;
+}
+
 export interface IUser {
   id?: string;
   name: string;
@@ -281,6 +291,17 @@ export const WireWebhookEventSchema = new Schema<IWireWebhookEvent & Document>(
   }
 );
 
+export const PasswordResetTokenSchema = new Schema<IPasswordResetToken & Document>(
+  {
+    userId: { type: String, required: true, index: true },
+    email: { type: String, required: true, index: true },
+    token: { type: String, required: true, unique: true, index: true },
+    expiresAt: { type: Date, required: true, index: true },
+    used: { type: Boolean, default: false }
+  },
+  { timestamps: true }
+);
+
 // Prevent re-compilation model errors in development
 export const UserModel =
   mongoose.models.User || mongoose.model<IUser & Document>('User', UserSchema);
@@ -304,4 +325,8 @@ export const SubscriptionModel =
 export const WireWebhookEventModel =
   mongoose.models.WireWebhookEvent ||
   mongoose.model<IWireWebhookEvent & Document>('WireWebhookEvent', WireWebhookEventSchema);
+
+export const PasswordResetTokenModel =
+  mongoose.models.PasswordResetToken ||
+  mongoose.model<IPasswordResetToken & Document>('PasswordResetToken', PasswordResetTokenSchema);
 
