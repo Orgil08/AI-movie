@@ -34,12 +34,16 @@ const SESSION_COOKIE = 'ai_movie_uid';
 const CSRF_COOKIE = 'ai_movie_csrf';
 
 function getAuthSecret(): string {
-  const secret = process.env.AUTH_SECRET;
-  if (secret && secret.length >= 32) return secret;
-  if (isProduction) {
-    throw new Error('AUTH_SECRET must be configured with at least 32 characters in production.');
+  const secret = process.env.AUTH_SECRET?.trim();
+  if (secret) {
+    return secret.length >= 32
+      ? secret
+      : crypto.createHash('sha256').update(secret).digest('hex');
   }
-  return secret || 'local-development-only-ai-movie-session-secret';
+  if (isProduction) {
+    throw new Error('AUTH_SECRET must be configured in production.');
+  }
+  return 'local-development-only-ai-movie-session-secret';
 }
 
 function readCookie(req: Request, cookieName: string): string | null {
@@ -79,7 +83,16 @@ function setSessionCookie(res: Response, userId: string, maxAgeSeconds: number):
 function requireCsrf(req: Request, res: Response, next: NextFunction): void {
   const cookieToken = readCookie(req, CSRF_COOKIE);
   const requestToken = (req.get('x-csrf-token') || req.body?.csrfToken || '').toString();
-  if (!cookieToken || !requestToken || !safeStringEqual(cookieToken, requestToken)) {
+  if (!requestToken) {
+    res.status(403).json({ error: 'CSRF_VALIDATION_FAILED', message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.' });
+    return;
+  }
+
+  const cookieMatches = Boolean(cookieToken && safeStringEqual(cookieToken, requestToken));
+  const signedClaims = verifySessionToken(requestToken);
+  const signatureMatches = Boolean(signedClaims && signedClaims.userId === 'csrf');
+
+  if (!cookieMatches && !signatureMatches) {
     res.status(403).json({ error: 'CSRF_VALIDATION_FAILED', message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.' });
     return;
   }
@@ -168,25 +181,33 @@ function getBaseUrl(req: Request): string {
 
 // Fail closed on Vercel/production: never silently authenticate against the
 // seeded in-memory development database when MongoDB is unavailable.
-app.use('/api', async (_req: Request, res: Response, next: NextFunction) => {
+app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
   if (!isProduction) return next();
 
-  if (!process.env.MONGODB_URI || process.env.MONGODB_URI.includes('<') || process.env.MONGODB_URI.includes('>')) {
-    return res.status(503).json({ error: 'DATABASE_NOT_CONFIGURED', message: 'Production MongoDB connection is not configured.' });
+  // Stateless utility endpoints do not require an active MongoDB connection
+  if (req.path === '/health' || req.path === '/auth/csrf' || req.path === '/auth/providers' || req.path === '/bank-details') {
+    if (!process.env.AUTH_SECRET?.trim() && req.path === '/auth/csrf') {
+      return res.status(503).json({ error: 'AUTH_SECRET_NOT_CONFIGURED', message: 'Production AUTH_SECRET is not configured in Vercel.' });
+    }
+    return next();
   }
-  if (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < 32) {
-    return res.status(503).json({ error: 'AUTH_SECRET_NOT_CONFIGURED', message: 'Production authentication secret is not configured.' });
+
+  if (!process.env.MONGODB_URI || process.env.MONGODB_URI.includes('<') || process.env.MONGODB_URI.includes('>')) {
+    return res.status(503).json({ error: 'DATABASE_NOT_CONFIGURED', message: 'Production MongoDB connection (MONGODB_URI) is not configured in Vercel.' });
+  }
+  if (!process.env.AUTH_SECRET?.trim()) {
+    return res.status(503).json({ error: 'AUTH_SECRET_NOT_CONFIGURED', message: 'Production authentication secret (AUTH_SECRET) is not configured in Vercel.' });
   }
 
   try {
     const connected = await connectDB();
     if (!connected) {
-      return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Authentication service is temporarily unavailable.' });
+      return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).' });
     }
     return next();
   } catch (error) {
     console.error('[API] Production database initialization failed:', error);
-    return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Authentication service is temporarily unavailable.' });
+    return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).' });
   }
 });
 
@@ -225,7 +246,7 @@ app.get('/api/auth/providers', (_req: Request, res: Response) => {
 });
 
 app.get('/api/auth/csrf', (_req: Request, res: Response) => {
-  const csrfToken = crypto.randomBytes(32).toString('hex');
+  const { token: csrfToken } = createSessionToken('csrf', 3600);
   const secure = isProduction ? '; Secure' : '';
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Pragma', 'no-cache');
@@ -1676,6 +1697,14 @@ function registerHtmlRoutes(vite: any = null) {
   if (isProduction) {
     app.use(express.static(distDir, { index: false }));
   }
+
+  // Catch-all JSON 404 for unknown /api/* endpoints
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({
+      error: 'API_NOT_FOUND',
+      message: 'API endpoint олдсонгүй.'
+    });
+  });
 
   // Handle all HTML/navigation routes with dynamic localized SEO metadata
   app.get('*', async (req: Request, res: Response, next: NextFunction) => {

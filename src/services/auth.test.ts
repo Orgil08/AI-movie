@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword, verifyPassword } from '../utils/crypto.js';
 import { Storage, memDb } from '../db/storage.js';
-import { signSessionToken, verifySessionToken } from '../server/app.js';
+import { createSignedSessionToken, verifySignedSessionToken } from '../utils/session.js';
 
 test('Password hashing and verification', () => {
   const password = 'SuperSecurePassword123!';
@@ -52,7 +52,7 @@ test('Pre-seeded demo accounts exist', async () => {
   assert.ok(temuulen, 'Temuulen demo user should be pre-seeded');
 });
 
-test('Auth.js endpoints and credentials provider integration', async () => {
+test('Auth endpoints and credentials verification', async () => {
   memDb.clear();
 
   // Test admin authorize
@@ -69,27 +69,23 @@ test('Auth.js endpoints and credentials provider integration', async () => {
 });
 
 test('Cryptographic session token sign and verify', () => {
+  const secret = 'test-secret-that-is-at-least-32-characters-long';
   const userId = 'usr_123456789';
 
-  const token = signSessionToken(userId);
-  assert.ok(token.startsWith(`s:${userId}.`), 'Token should start with s: and contain userId');
-
-  const verified = verifySessionToken(token);
-  assert.equal(verified, userId, 'Verified userId should match original userId');
+  const { token } = createSignedSessionToken(userId, secret, 3600);
+  const verified = verifySignedSessionToken(token, secret);
+  assert.equal(verified?.userId, userId, 'Verified userId should match original userId');
 
   // Tampered payload
-  assert.equal(verifySessionToken(`tampered_${token}`), null, 'Tampered token without s: prefix should be rejected');
+  assert.equal(verifySignedSessionToken(`tampered_${token}`, secret), null, 'Tampered token should be rejected');
 
   // Tampered signature
   const parts = token.split('.');
-  const badSigToken = `${parts[0]}.${parts[1]}wrong`;
-  assert.equal(verifySessionToken(badSigToken), null, 'Bad signature should be rejected');
-
-  // Tampered user id inside prefix
-  const fakeToken = `s:other_user.${parts[1]}`;
-  assert.equal(verifySessionToken(fakeToken), null, 'Mismatched user id signature should be rejected');
+  const badSigToken = `${parts[0]}.${parts[1]}.${parts[2]}wrong`;
+  assert.equal(verifySignedSessionToken(badSigToken, secret), null, 'Bad signature should be rejected');
 
   // Malformed tokens
-  assert.equal(verifySessionToken('no-dot-token'), null, 'Malformed token without dot should be rejected');
-  assert.equal(verifySessionToken(''), null, 'Empty token should be rejected');
+  assert.equal(verifySignedSessionToken('no-dot-token', secret), null, 'Malformed token without dot should be rejected');
+  assert.equal(verifySignedSessionToken('', secret), null, 'Empty token should be rejected');
 });
+
