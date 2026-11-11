@@ -1,6 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
-export type PaymentStatus = 'PENDING' | 'PAID' | 'EXPIRED' | 'FAILED';
+export type PaymentStatus = 'PENDING' | 'PENDING_REVIEW' | 'PAID' | 'REJECTED' | 'EXPIRED' | 'FAILED';
 export type SubscriptionStatus = 'ACTIVE' | 'EXPIRED' | 'CANCELLED';
 
 export type PaymentMethod = 'wire_qpay' | 'bank_transfer';
@@ -22,6 +22,11 @@ export interface IPayment {
   checkoutUrl?: string;
   createdAt: Date;
   paidAt?: Date;
+  verifiedByAdminId?: string;
+  verifiedByAdminEmail?: string;
+  verifiedAt?: Date;
+  previousStatus?: PaymentStatus;
+  rejectionReason?: string;
 }
 
 export interface ISubscription {
@@ -51,7 +56,7 @@ export interface IPasswordResetToken {
   id?: string;
   userId: string;
   email: string;
-  token: string;
+  tokenHash: string;
   expiresAt: Date;
   used: boolean;
   createdAt: Date;
@@ -76,6 +81,8 @@ export interface IMovie {
   // Backward-compatible fields
   titleMn?: string;
   titleEn?: string;
+  synopsisMn?: string;
+  synopsisEn?: string;
   descriptionMn?: string;
   descriptionEn?: string;
   slug?: string;
@@ -88,6 +95,7 @@ export interface IMovie {
   year: number;
   duration: string;
   genres: string[];
+  genre?: { mn: string; en: string };
   genreMn?: string;
   genreEn?: string;
   rating: string;
@@ -102,6 +110,8 @@ export interface IMovie {
   language?: string;
   type?: 'movie' | 'series';
   featured: boolean;
+  trending?: boolean;
+  top10?: number;
   isPremium: boolean;
   minPlan: 'basic' | 'standard' | 'premium';
   published: boolean;
@@ -132,14 +142,38 @@ export interface IAuditLog {
   createdAt: Date;
 }
 
+export interface IFaqItem {
+  qMn: string;
+  aMn: string;
+  qEn: string;
+  aEn: string;
+}
+
 export interface IWebsiteSettings {
+  id?: string;
+  key?: string;
   siteName: string;
   taglineMn: string;
   taglineEn: string;
+  featuredMovieId?: string;
+  announcementMn: string;
+  announcementEn: string;
   maintenanceMode: boolean;
   allowRegistrations: boolean;
   primaryCurrency: string;
+  defaultLocale: 'mn' | 'en';
   contactEmail: string;
+  contactPhone?: string;
+  streamingQualityDefault?: string;
+  bankTransferEnabled?: boolean;
+  qpayEnabled?: boolean;
+  subscriptionPrices?: {
+    basic: number;
+    standard: number;
+    premium: number;
+  };
+  faqItems?: IFaqItem[];
+  updatedAt?: Date;
 }
 
 /* ============================================================
@@ -171,9 +205,11 @@ export const MovieSchema = new Schema<IMovie & Document>(
     },
     titleMn: { type: String },
     titleEn: { type: String },
+    synopsisMn: { type: String },
+    synopsisEn: { type: String },
     descriptionMn: { type: String },
     descriptionEn: { type: String },
-    slug: { type: String, index: true },
+    slug: { type: String, unique: true, sparse: true, index: true },
     posterUrl: { type: String, required: true },
     backdropUrl: { type: String, required: true },
     bannerUrl: { type: String },
@@ -203,6 +239,8 @@ export const MovieSchema = new Schema<IMovie & Document>(
     language: { type: String, default: 'mn' },
     type: { type: String, enum: ['movie', 'series'], default: 'movie' },
     featured: { type: Boolean, default: false, index: true },
+    trending: { type: Boolean, default: false },
+    top10: { type: Number, default: null },
     isPremium: { type: Boolean, default: true },
     minPlan: { type: String, enum: ['basic', 'standard', 'premium'], default: 'basic' },
     published: { type: Boolean, default: true, index: true },
@@ -252,12 +290,17 @@ export const PaymentSchema = new Schema<IPayment & Document>(
     currency: { type: String, required: true, default: 'MNT' },
     status: {
       type: String,
-      enum: ['PENDING', 'PAID', 'EXPIRED', 'FAILED'],
+      enum: ['PENDING', 'PENDING_REVIEW', 'PAID', 'REJECTED', 'EXPIRED', 'FAILED'],
       default: 'PENDING',
       index: true
     },
     checkoutUrl: { type: String, default: null },
-    paidAt: { type: Date, default: null }
+    paidAt: { type: Date, default: null },
+    verifiedByAdminId: { type: String, default: null },
+    verifiedByAdminEmail: { type: String, default: null },
+    verifiedAt: { type: Date, default: null },
+    previousStatus: { type: String, default: null },
+    rejectionReason: { type: String, default: null }
   },
   { timestamps: { createdAt: true, updatedAt: false } }
 );
@@ -295,9 +338,47 @@ export const PasswordResetTokenSchema = new Schema<IPasswordResetToken & Documen
   {
     userId: { type: String, required: true, index: true },
     email: { type: String, required: true, index: true },
-    token: { type: String, required: true, unique: true, index: true },
+    tokenHash: { type: String, required: true, unique: true, index: true },
     expiresAt: { type: Date, required: true, index: true },
     used: { type: Boolean, default: false }
+  },
+  { timestamps: true }
+);
+
+export const WebsiteSettingsSchema = new Schema<IWebsiteSettings & Document>(
+  {
+    key: { type: String, required: true, unique: true, default: 'global', index: true },
+    siteName: { type: String, default: 'SODON AI MOVIE' },
+    taglineMn: { type: String, default: 'Киноны Дараагийн Үе' },
+    taglineEn: { type: String, default: 'Next-Gen AI Cinema' },
+    featuredMovieId: { type: String, default: '' },
+    announcementMn: { type: String, default: 'AI Кино платформд тавтай морилно уу.' },
+    announcementEn: { type: String, default: 'Welcome to AI Movie streaming platform.' },
+    maintenanceMode: { type: Boolean, default: false },
+    allowRegistrations: { type: Boolean, default: true },
+    primaryCurrency: { type: String, default: 'MNT' },
+    defaultLocale: { type: String, enum: ['mn', 'en'], default: 'mn' },
+    contactEmail: { type: String, default: 'support@aimovie.mn' },
+    contactPhone: { type: String, default: '+976 7711-2099' },
+    streamingQualityDefault: { type: String, default: '4K HDR' },
+    bankTransferEnabled: { type: Boolean, default: true },
+    qpayEnabled: { type: Boolean, default: true },
+    subscriptionPrices: {
+      basic: { type: Number, default: 9900 },
+      standard: { type: Number, default: 14900 },
+      premium: { type: Number, default: 19900 }
+    },
+    faqItems: {
+      type: [
+        {
+          qMn: { type: String },
+          aMn: { type: String },
+          qEn: { type: String },
+          aEn: { type: String }
+        }
+      ],
+      default: []
+    }
   },
   { timestamps: true }
 );
@@ -330,3 +411,6 @@ export const PasswordResetTokenModel =
   mongoose.models.PasswordResetToken ||
   mongoose.model<IPasswordResetToken & Document>('PasswordResetToken', PasswordResetTokenSchema);
 
+export const WebsiteSettingsModel =
+  mongoose.models.WebsiteSettings ||
+  mongoose.model<IWebsiteSettings & Document>('WebsiteSettings', WebsiteSettingsSchema);

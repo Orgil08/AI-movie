@@ -50,8 +50,10 @@ type AdminSection =
   | 'users'
   | 'payments'
   | 'subscriptions'
+  | 'audit-logs'
   | 'analytics'
-  | 'settings';
+  | 'settings'
+  | 'profile';
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({
   currentUser,
@@ -72,6 +74,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [paymentsList, setPaymentsList] = useState<any[]>([]);
   const [subscriptionsList, setSubscriptionsList] = useState<any[]>([]);
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
+  const [webhookEvents, setWebhookEvents] = useState<any[]>([]);
+  const [uploadConfig, setUploadConfig] = useState<{ configured: boolean; provider: string }>({
+    configured: false,
+    provider: 'cloudinary'
+  });
+  const [uploadingField, setUploadingField] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -84,6 +92,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   // Movie form state (for add & edit)
   const [selectedMovieForEdit, setSelectedMovieForEdit] = useState<any | null>(null);
   const [deleteConfirmMovie, setDeleteConfirmMovie] = useState<any | null>(null);
+  const [movieSubmitting, setMovieSubmitting] = useState(false);
 
   // Add / Edit movie form inputs
   const [formData, setFormData] = useState({
@@ -119,23 +128,58 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [newCatNameMn, setNewCatNameMn] = useState('');
   const [newCatNameEn, setNewCatNameEn] = useState('');
   const [newCatDescMn, setNewCatDescMn] = useState('');
+  const [newCatImageUrl, setNewCatImageUrl] = useState('');
 
   // Subscription adjustment modal state
   const [subAdjustModal, setSubAdjustModal] = useState<{ userId: string; userName: string } | null>(null);
   const [adjustPlanId, setAdjustPlanId] = useState('premium');
   const [adjustDurationDays, setAdjustDurationDays] = useState(30);
 
-  // Website Settings state
-  const [siteSettings, setSiteSettings] = useState({
+  // Bank transfer rejection reason modal state
+  const [rejectPaymentModal, setRejectPaymentModal] = useState<any | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [processingPaymentId, setProcessingPaymentId] = useState<string | null>(null);
+
+  // Website Settings state (persisted in MongoDB)
+  const [siteSettings, setSiteSettings] = useState<{
+    siteName: string;
+    taglineMn: string;
+    taglineEn: string;
+    featuredMovieId: string;
+    announcementMn: string;
+    announcementEn: string;
+    maintenanceMode: boolean;
+    allowRegistrations: boolean;
+    defaultLocale: 'mn' | 'en';
+    primaryCurrency: string;
+    subscriptionPrices: { basic: number; standard: number; premium: number };
+    faq: Array<{ questionMn: string; questionEn: string; answerMn: string; answerEn: string }>;
+  }>({
     siteName: 'SODON AI MOVIE',
+    taglineMn: 'Монголын анхны хиймэл оюун ухаант 4K стриминг платформ',
+    taglineEn: 'Premier 4K Generative AI Cinema Platform',
+    featuredMovieId: '',
+    announcementMn: '',
+    announcementEn: '',
     maintenanceMode: false,
     allowRegistrations: true,
-    primaryCurrency: 'MNT'
+    defaultLocale: 'mn',
+    primaryCurrency: 'MNT',
+    subscriptionPrices: { basic: 9900, standard: 14900, premium: 19900 },
+    faq: []
   });
+  const [savingSettings, setSavingSettings] = useState(false);
+
+  // Admin Profile state
+  const [profileName, setProfileName] = useState(currentUser?.name || '');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [profileSaving, setProfileSaving] = useState(false);
 
   const notify = (type: 'success' | 'error', message: string) => {
     setFeedback({ type, message });
-    setTimeout(() => setFeedback(null), 4000);
+    setTimeout(() => setFeedback(null), 5000);
   };
 
   const fetchStats = async () => {
@@ -210,6 +254,47 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     } catch (e) {}
   };
 
+  const fetchWebhooks = async () => {
+    try {
+      const res = await authFetch('/api/admin/webhooks');
+      if (res.ok) {
+        const d = await res.json();
+        setWebhookEvents(d.events || []);
+      }
+    } catch (e) {}
+  };
+
+  const fetchSettings = async () => {
+    try {
+      const res = await authFetch('/api/admin/settings');
+      if (res.ok) {
+        const d = await res.json();
+        if (d.settings) {
+          setSiteSettings((prev) => ({
+            ...prev,
+            ...d.settings,
+            subscriptionPrices: {
+              basic: d.settings.subscriptionPrices?.basic ?? 9900,
+              standard: d.settings.subscriptionPrices?.standard ?? 14900,
+              premium: d.settings.subscriptionPrices?.premium ?? 19900
+            },
+            faq: Array.isArray(d.settings.faq) ? d.settings.faq : []
+          }));
+        }
+      }
+    } catch (e) {}
+  };
+
+  const fetchUploadConfig = async () => {
+    try {
+      const res = await authFetch('/api/admin/upload/config');
+      if (res.ok) {
+        const d = await res.json();
+        setUploadConfig({ configured: Boolean(d.configured), provider: d.provider || 'cloudinary' });
+      }
+    } catch (e) {}
+  };
+
   const refreshAllData = async () => {
     setLoading(true);
     await Promise.all([
@@ -219,7 +304,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       fetchUsers(),
       fetchPayments(),
       fetchSubscriptions(),
-      fetchAuditLogs()
+      fetchAuditLogs(),
+      fetchWebhooks(),
+      fetchSettings(),
+      fetchUploadConfig()
     ]);
     setLoading(false);
   };
@@ -228,9 +316,54 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     refreshAllData();
   }, []);
 
+  // Handle Cloudinary image upload (Phase 5)
+  const handleFileUpload = async (file: File, target: 'posterUrl' | 'backdropUrl' | 'categoryImage') => {
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      notify('error', locale === 'en' ? 'Image size must not exceed 5MB.' : 'Зургийн хэмжээ 5MB-аас хэтрэхгүй байх ёстой.');
+      return;
+    }
+
+    setUploadingField(target);
+    try {
+      const base64Data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error('Failed to read image file'));
+        reader.readAsDataURL(file);
+      });
+
+      const res = await authFetch('/api/admin/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName: file.name, base64Data })
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        notify('error', locale === 'en' ? (data.messageEn || data.message || 'Image upload failed') : (data.message || 'Зураг хуулахад алдаа гарлаа.'));
+        return;
+      }
+
+      if (target === 'posterUrl') {
+        setFormData((prev) => ({ ...prev, posterUrl: data.url }));
+      } else if (target === 'backdropUrl') {
+        setFormData((prev) => ({ ...prev, backdropUrl: data.url }));
+      } else if (target === 'categoryImage') {
+        setNewCatImageUrl(data.url);
+      }
+      notify('success', locale === 'en' ? 'Image uploaded to Cloudinary!' : 'Зураг Cloudinary руу амжилттай хуулагдлаа!');
+    } catch (err: any) {
+      notify('error', err.message || 'Зураг хуулахад алдаа гарлаа.');
+    } finally {
+      setUploadingField(null);
+    }
+  };
+
   // Handle movie submission (Create or Update)
   const handleMovieSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setMovieSubmitting(true);
     try {
       const isEditing = Boolean(selectedMovieForEdit);
       const url = isEditing ? `/api/admin/movies/${selectedMovieForEdit.id}` : '/api/admin/movies';
@@ -244,17 +377,19 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       const data = await res.json();
 
       if (!res.ok) {
-        notify('error', data.message || 'Алдаа гарлаа.');
+        // Preserve entered form data on failure
+        notify('error', data.message || 'Кино хадгалахад алдаа гарлаа.');
         return;
       }
 
-      notify('success', data.message || 'Амжилттай хадгалагдлаа.');
-      await fetchMovies();
-      await fetchStats();
+      notify('success', data.message || 'Кино MongoDB өгөгдлийн санд амжилттай хадгалагдлаа.');
+      await Promise.all([fetchMovies(), fetchStats(), fetchAuditLogs()]);
       setActiveSection('movies');
       setSelectedMovieForEdit(null);
     } catch (err: any) {
       notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setMovieSubmitting(false);
     }
   };
 
@@ -262,22 +397,32 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const handleTogglePublish = async (movieId: string) => {
     try {
       const res = await authFetch(`/api/admin/movies/${movieId}/toggle-publish`, { method: 'PATCH' });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        await fetchMovies();
+        await Promise.all([fetchMovies(), fetchStats(), fetchAuditLogs()]);
         notify('success', 'Киноны нийтлэлийн төлөв өөрчлөгдлөө.');
+      } else {
+        notify('error', data.message || 'Төлөв өөрчлөхөд алдаа гарлаа.');
       }
-    } catch (e) {}
+    } catch (e: any) {
+      notify('error', e.message || 'Сүлжээний алдаа.');
+    }
   };
 
   // Toggle featured
   const handleToggleFeatured = async (movieId: string) => {
     try {
       const res = await authFetch(`/api/admin/movies/${movieId}/toggle-featured`, { method: 'PATCH' });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        await fetchMovies();
+        await Promise.all([fetchMovies(), fetchAuditLogs()]);
         notify('success', 'Онцлох төлөв өөрчлөгдлөө.');
+      } else {
+        notify('error', data.message || 'Төлөв өөрчлөхөд алдаа гарлаа.');
       }
-    } catch (e) {}
+    } catch (e: any) {
+      notify('error', e.message || 'Сүлжээний алдаа.');
+    }
   };
 
   // Delete movie
@@ -285,11 +430,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     if (!deleteConfirmMovie) return;
     try {
       const res = await authFetch(`/api/admin/movies/${deleteConfirmMovie.id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         notify('success', 'Кино амжилттай устгагдлаа.');
         setDeleteConfirmMovie(null);
-        await fetchMovies();
-        await fetchStats();
+        await Promise.all([fetchMovies(), fetchStats(), fetchAuditLogs()]);
+      } else {
+        notify('error', data.message || 'Устгахад алдаа гарлаа.');
       }
     } catch (e) {
       notify('error', 'Устгахад алдаа гарлаа.');
@@ -303,15 +450,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       titleMn: movie.titleMn || movie.title?.mn || '',
       titleEn: movie.titleEn || movie.title?.en || '',
       slug: movie.slug || movie.id,
-      synopsisMn: movie.descriptionMn || movie.synopsis?.mn || '',
-      synopsisEn: movie.descriptionEn || movie.synopsis?.en || '',
+      synopsisMn: movie.synopsisMn || movie.descriptionMn || movie.synopsis?.mn || '',
+      synopsisEn: movie.synopsisEn || movie.descriptionEn || movie.synopsis?.en || '',
       posterUrl: movie.posterUrl || '',
-      backdropUrl: movie.backdropUrl || movie.posterUrl || '',
+      backdropUrl: movie.backdropUrl || movie.bannerUrl || movie.posterUrl || '',
       videoUrl: movie.videoUrl || movie.videoSource || '',
       trailerUrl: movie.trailerUrl || '',
       year: movie.year || 2026,
       duration: movie.duration || '2h 00m',
-      genres: movie.genres || ['Sci-Fi'],
+      genres: Array.isArray(movie.genres) && movie.genres.length > 0 ? movie.genres : ['Sci-Fi'],
       rating: movie.rating || '9.0',
       ageRating: movie.ageRating || '13+',
       quality: movie.quality || '4K HDR',
@@ -341,16 +488,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           slug: newCatSlug.toLowerCase().trim(),
           nameMn: newCatNameMn.trim(),
           nameEn: newCatNameEn.trim(),
-          descriptionMn: newCatDescMn.trim()
+          descriptionMn: newCatDescMn.trim(),
+          imageUrl: newCatImageUrl.trim() || undefined
         })
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         notify('success', 'Ангилал амжилттай нэмэгдлээ.');
         setNewCatSlug('');
         setNewCatNameMn('');
         setNewCatNameEn('');
         setNewCatDescMn('');
-        await fetchCategories();
+        setNewCatImageUrl('');
+        await Promise.all([fetchCategories(), fetchAuditLogs()]);
+      } else {
+        notify('error', data.message || 'Ангилал нэмэхэд алдаа гарлаа.');
       }
     } catch (e) {}
   };
@@ -361,7 +513,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       const res = await authFetch(`/api/admin/categories/${catId}`, { method: 'DELETE' });
       if (res.ok) {
         notify('success', 'Ангилал устгагдлаа.');
-        await fetchCategories();
+        await Promise.all([fetchCategories(), fetchAuditLogs()]);
       }
     } catch (e) {}
   };
@@ -381,8 +533,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         return;
       }
       notify('success', `${u.name} хэрэглэгчийн эрх: ${newRole}`);
-      await fetchUsers();
-      await fetchStats();
+      await Promise.all([fetchUsers(), fetchStats(), fetchAuditLogs()]);
     } catch (e: any) {
       notify('error', e.message);
     }
@@ -403,9 +554,59 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         return;
       }
       notify('success', `${u.name} хэрэглэгч: ${newStatus}`);
-      await fetchUsers();
+      await Promise.all([fetchUsers(), fetchAuditLogs()]);
     } catch (e: any) {
       notify('error', e.message);
+    }
+  };
+
+  // Approve Bank Transfer Payment (Phase 3)
+  const handleApprovePayment = async (payment: any) => {
+    const paymentKey = payment.orderNumber || payment.id;
+    setProcessingPaymentId(paymentKey);
+    try {
+      const res = await authFetch(`/api/admin/payments/${paymentKey}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.message || 'Төлбөр баталгаажуулахад алдаа гарлаа.');
+        return;
+      }
+      notify('success', data.message || 'Төлбөр баталгаажиж гишүүнчлэл идэвхжлээ.');
+      await Promise.all([fetchPayments(), fetchSubscriptions(), fetchUsers(), fetchStats(), fetchAuditLogs()]);
+    } catch (err: any) {
+      notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setProcessingPaymentId(null);
+    }
+  };
+
+  // Reject Bank Transfer Payment (Phase 3)
+  const handleConfirmRejectPayment = async () => {
+    if (!rejectPaymentModal) return;
+    const paymentKey = rejectPaymentModal.orderNumber || rejectPaymentModal.id;
+    setProcessingPaymentId(paymentKey);
+    try {
+      const res = await authFetch(`/api/admin/payments/${paymentKey}/reject`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: rejectReason.trim() || 'Банкны хуулгаар гүйлгээ олдсонгүй.' })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.message || 'Төлбөр татгалзахад алдаа гарлаа.');
+        return;
+      }
+      notify('success', data.message || 'Төлбөрийн хүсэлтийг татгалзлаа.');
+      setRejectPaymentModal(null);
+      setRejectReason('');
+      await Promise.all([fetchPayments(), fetchStats(), fetchAuditLogs()]);
+    } catch (err: any) {
+      notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setProcessingPaymentId(null);
     }
   };
 
@@ -425,11 +626,91 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       if (res.ok) {
         notify('success', 'Гишүүнчлэл амжилттай тохируулагдлаа.');
         setSubAdjustModal(null);
-        await fetchSubscriptions();
-        await fetchStats();
+        await Promise.all([fetchSubscriptions(), fetchUsers(), fetchStats(), fetchAuditLogs()]);
       }
     } catch (e) {
       notify('error', 'Тохируулахад алдаа гарлаа.');
+    }
+  };
+
+  // Save Website Settings (Phase 7)
+  const handleSaveSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingSettings(true);
+    try {
+      const res = await authFetch('/api/admin/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(siteSettings)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.message || 'Тохиргоо хадгалахад алдаа гарлаа.');
+        return;
+      }
+      if (data.settings) {
+        setSiteSettings((prev) => ({ ...prev, ...data.settings }));
+      }
+      notify('success', data.message || 'Сайтын тохиргоо MongoDB-д амжилттай хадгалагдлаа.');
+      await fetchAuditLogs();
+    } catch (err: any) {
+      notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  // Admin Profile Update & Password Change (Phase 8)
+  const handleUpdateAdminProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!profileName.trim()) return;
+    setProfileSaving(true);
+    try {
+      const res = await authFetch('/api/auth/update-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: profileName.trim() })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.message || 'Профайл шинэчлэхэд алдаа гарлаа.');
+        return;
+      }
+      notify('success', 'Админ нэр амжилттай шинэчлэгдлээ.');
+    } catch (err: any) {
+      notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const handleChangeAdminPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentPassword || !newPassword) return;
+    if (newPassword !== confirmNewPassword) {
+      notify('error', 'Шинэ нууц үг хоорондоо таарахгүй байна.');
+      return;
+    }
+    setProfileSaving(true);
+    try {
+      const res = await authFetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.message || 'Нууц үг солиход алдаа гарлаа.');
+        return;
+      }
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmNewPassword('');
+      notify('success', 'Админ нууц үг амжилттай солигдлоо.');
+    } catch (err: any) {
+      notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setProfileSaving(false);
     }
   };
 
@@ -456,17 +737,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     return p.status === paymentStatusFilter;
   });
 
-  // Nav menu items
+  const pendingReviewCount = paymentsList.filter((p) => p.status === 'PENDING_REVIEW').length;
+
+  // Nav menu items (All 10 required sections)
   const menuItems = [
     { id: 'dashboard', label: tAdmin('dashboardNav'), icon: LayoutDashboard },
     { id: 'movies', label: tAdmin('moviesNav'), icon: Film, count: movies.length },
     { id: 'add-movie', label: tAdmin('addMovieNav'), icon: PlusCircle },
     { id: 'categories', label: tAdmin('categoriesNav'), icon: FolderTree, count: categories.length },
     { id: 'users', label: tAdmin('usersNav'), icon: Users, count: usersList.length },
-    { id: 'payments', label: tAdmin('paymentsNav'), icon: CreditCard, count: paymentsList.length },
+    { id: 'payments', label: tAdmin('paymentsNav'), icon: CreditCard, count: pendingReviewCount || paymentsList.length },
     { id: 'subscriptions', label: tAdmin('subscriptionsNav'), icon: Crown, count: subscriptionsList.length },
+    { id: 'audit-logs', label: locale === 'en' ? 'Audit Trail' : 'Аудит лог', icon: Shield, count: auditLogs.length },
     { id: 'analytics', label: tAdmin('analyticsNav'), icon: BarChart3 },
-    { id: 'settings', label: tAdmin('settingsNav'), icon: Settings }
+    { id: 'settings', label: tAdmin('settingsNav'), icon: Settings },
+    { id: 'profile', label: locale === 'en' ? 'Admin Profile' : 'Админ профайл', icon: UserCheck }
   ];
 
   return (
@@ -1129,42 +1414,93 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   </div>
                 </div>
 
-                {/* 6 & 7. Poster & Backdrop with Image Previews */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-white/5 border border-white/10">
-                  <div className="space-y-2">
-                    <label className="block font-bold text-slate-300">Постер зураг (Poster URL) *</label>
-                    <input
-                      type="url"
-                      required
-                      value={formData.posterUrl}
-                      onChange={(e) => setFormData({ ...formData, posterUrl: e.target.value })}
-                      placeholder="https://..."
-                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white text-xs"
-                    />
-                    {formData.posterUrl && (
-                      <div className="mt-2 flex items-center gap-2">
-                        <img src={formData.posterUrl} alt="Poster preview" className="w-16 h-24 object-cover rounded-md border border-white/20" />
-                        <span className="text-[10px] text-slate-400">Постер урьдчилан харах</span>
-                      </div>
-                    )}
+                {/* 6 & 7. Poster & Backdrop with Cloudinary Upload & Image Previews */}
+                <div className="p-4 rounded-xl bg-white/5 border border-white/10 space-y-4">
+                  <div className="flex items-center justify-between text-[11px] text-slate-400">
+                    <span>
+                      {uploadConfig.configured
+                        ? 'Cloudinary үүлэн хадгалалт идэвхтэй (Зураг шууд хуулах эсвэл URL оруулах)'
+                        : 'Зургийн URL оруулах эсвэл Cloudinary тохируулж файл хуулах боломжтой'}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded font-bold text-[10px] ${
+                        uploadConfig.configured
+                          ? 'bg-emerald-500/20 text-emerald-400'
+                          : 'bg-amber-500/20 text-amber-300'
+                      }`}
+                    >
+                      {uploadConfig.configured ? 'CLOUDINARY READY' : 'URL FALLBACK MODE'}
+                    </span>
                   </div>
 
-                  <div className="space-y-2">
-                    <label className="block font-bold text-slate-300">Backdrop баннер зураг (Backdrop URL) *</label>
-                    <input
-                      type="url"
-                      required
-                      value={formData.backdropUrl}
-                      onChange={(e) => setFormData({ ...formData, backdropUrl: e.target.value })}
-                      placeholder="https://..."
-                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white text-xs"
-                    />
-                    {formData.backdropUrl && (
-                      <div className="mt-2 flex items-center gap-2">
-                        <img src={formData.backdropUrl} alt="Backdrop preview" className="w-28 h-16 object-cover rounded-md border border-white/20" />
-                        <span className="text-[10px] text-slate-400">Баннер урьдчилан харах</span>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <label className="block font-bold text-slate-300">Постер зураг (Poster URL) *</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="url"
+                          required
+                          value={formData.posterUrl}
+                          onChange={(e) => setFormData({ ...formData, posterUrl: e.target.value })}
+                          placeholder="https://..."
+                          className="flex-1 px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white text-xs"
+                        />
+                        <label className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shrink-0">
+                          <Upload className="w-3.5 h-3.5 text-[#e5a93c]" />
+                          <span>{uploadingField === 'posterUrl' ? '...' : 'Файл'}</span>
+                          <input
+                            type="file"
+                            accept="image/jpeg,image/png,image/webp,image/gif"
+                            className="hidden"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file) handleFileUpload(file, 'posterUrl');
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
                       </div>
-                    )}
+                      {formData.posterUrl && (
+                        <div className="mt-2 flex items-center gap-2">
+                          <img src={formData.posterUrl} alt="Poster preview" className="w-16 h-24 object-cover rounded-md border border-white/20" />
+                          <span className="text-[10px] text-slate-400">Постер урьдчилан харах</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="block font-bold text-slate-300">Backdrop баннер зураг (Backdrop URL) *</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="url"
+                          required
+                          value={formData.backdropUrl}
+                          onChange={(e) => setFormData({ ...formData, backdropUrl: e.target.value })}
+                          placeholder="https://..."
+                          className="flex-1 px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white text-xs"
+                        />
+                        <label className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shrink-0">
+                          <Upload className="w-3.5 h-3.5 text-[#e5a93c]" />
+                          <span>{uploadingField === 'backdropUrl' ? '...' : 'Файл'}</span>
+                          <input
+                            type="file"
+                            accept="image/jpeg,image/png,image/webp,image/gif"
+                            className="hidden"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file) handleFileUpload(file, 'backdropUrl');
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                      </div>
+                      {formData.backdropUrl && (
+                        <div className="mt-2 flex items-center gap-2">
+                          <img src={formData.backdropUrl} alt="Backdrop preview" className="w-28 h-16 object-cover rounded-md border border-white/20" />
+                          <span className="text-[10px] text-slate-400">Баннер урьдчилан харах</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -1191,6 +1527,27 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white font-mono"
                     />
                   </div>
+                </div>
+
+                {/* Genres (Multi-value input / tag chips) */}
+                <div>
+                  <label className="block font-bold text-slate-300 mb-1.5">
+                    Төрөл жанр (Genres — таслалаар тусгаарлана уу) *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={formData.genres.join(', ')}
+                    onChange={(e) => {
+                      const list = e.target.value
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean);
+                      setFormData({ ...formData, genres: list.length > 0 ? list : ['Sci-Fi'] });
+                    }}
+                    placeholder="Sci-Fi, Уран Зөгнөлт, Action, Түүхэн"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                  />
                 </div>
 
                 {/* 10, 11, 12, 13, 14, 15, 16, 17: Technical Attributes */}
@@ -1349,15 +1706,20 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   <button
                     type="button"
                     onClick={() => setActiveSection('movies')}
-                    className="px-4 py-2.5 rounded-xl bg-white/10 text-white font-bold"
+                    className="px-4 py-2.5 rounded-xl bg-white/10 text-white font-bold cursor-pointer"
                   >
                     {locale === 'en' ? 'Cancel' : 'Цуцлах'}
                   </button>
                   <button
                     type="submit"
-                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-[#e50914] to-rose-700 hover:brightness-110 text-white font-black shadow-lg shadow-rose-950/40"
+                    disabled={movieSubmitting}
+                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-[#e50914] to-rose-700 hover:brightness-110 text-white font-black shadow-lg shadow-rose-950/40 cursor-pointer disabled:opacity-50"
                   >
-                    {selectedMovieForEdit ? tAdmin('saveChanges') : 'Шинэ Кино Нэмэх'}
+                    {movieSubmitting
+                      ? 'Хадгалж байна...'
+                      : selectedMovieForEdit
+                      ? tAdmin('saveChanges')
+                      : 'Шинэ Кино Нэмэх'}
                   </button>
                 </div>
               </form>
@@ -1417,6 +1779,32 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                   </div>
 
                   <div>
+                    <label className="block text-xs text-slate-400 mb-1">Ангиллын зураг (Сонголттой)</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        value={newCatImageUrl}
+                        onChange={(e) => setNewCatImageUrl(e.target.value)}
+                        placeholder="https://..."
+                        className="flex-1 px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white text-xs"
+                      />
+                      <label className="px-2.5 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-bold flex items-center gap-1 cursor-pointer shrink-0">
+                        <Upload className="w-3.5 h-3.5 text-[#e5a93c]" />
+                        <input
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp,image/gif"
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (file) handleFileUpload(file, 'categoryImage');
+                            e.target.value = '';
+                          }}
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div>
                     <label className="block text-xs text-slate-400 mb-1">Тайлбар</label>
                     <textarea
                       rows={2}
@@ -1459,7 +1847,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           <td className="py-3 px-4 text-right">
                             <button
                               onClick={() => handleDeleteCategory(c.id)}
-                              className="p-1 rounded text-rose-400 hover:bg-rose-500/20"
+                              className="p-1 rounded text-rose-400 hover:bg-rose-500/20 cursor-pointer"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -1553,13 +1941,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           <div className="flex items-center justify-end gap-1.5">
                             <button
                               onClick={() => setSubAdjustModal({ userId: u.id, userName: u.name })}
-                              className="px-2.5 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-[#e5a93c] text-[10px] font-bold"
+                              className="px-2.5 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-[#e5a93c] text-[10px] font-bold cursor-pointer"
                             >
                               Багц нэмэх
                             </button>
                             <button
                               onClick={() => handleToggleUserStatus(u)}
-                              className={`p-1.5 rounded-lg text-xs ${
+                              className={`p-1.5 rounded-lg text-xs cursor-pointer ${
                                 u.status === 'suspended'
                                   ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
                                   : 'bg-rose-500/10 text-rose-400 hover:bg-rose-500/20'
@@ -1579,18 +1967,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           )}
 
           {/* ========================================================= */}
-          {/* 7. PAYMENTS MANAGEMENT */}
+          {/* 7. PAYMENTS MANAGEMENT (With Bank Transfer Approve/Reject) */}
           {/* ========================================================= */}
           {activeSection === 'payments' && (
             <div className="space-y-6 animate-in fade-in">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="text-xs text-slate-400 font-bold">{tAdmin('statusCol')}:</span>
-                  {['all', 'PAID', 'PENDING', 'EXPIRED'].map((st) => (
+                  {['all', 'PENDING_REVIEW', 'PENDING', 'PAID', 'REJECTED', 'EXPIRED'].map((st) => (
                     <button
                       key={st}
                       onClick={() => setPaymentStatusFilter(st)}
-                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase transition ${
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase transition cursor-pointer ${
                         paymentStatusFilter === st
                           ? 'bg-[#e5a93c] text-black'
                           : 'bg-white/5 text-slate-400 hover:bg-white/10'
@@ -1600,6 +1988,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </button>
                   ))}
                 </div>
+
+                {pendingReviewCount > 0 && (
+                  <div className="px-3 py-1.5 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-bold flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-[#e5a93c]" />
+                    <span>Шалгах хүлээгдэж буй банкны шилжүүлэг: {pendingReviewCount}</span>
+                  </div>
+                )}
               </div>
 
               <div className="overflow-x-auto rounded-2xl border border-white/10 bg-[#0f172a] shadow-xl">
@@ -1608,44 +2003,106 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     <tr>
                       <th className="py-3 px-4">Захиалгын №</th>
                       <th className="py-3 px-4">Хэрэглэгч</th>
-                      <th className="py-3 px-4">Багц</th>
-                      <th className="py-3 px-4">Дүн</th>
-                      <th className="py-3 px-4">Суваг</th>
+                      <th className="py-3 px-4">Багц / Дүн</th>
+                      <th className="py-3 px-4">Суваг & Шилжүүлгийн мэдээлэл</th>
                       <th className="py-3 px-4">Төлөв</th>
-                      <th className="py-3 px-4 text-right">Огноо</th>
+                      <th className="py-3 px-4">Огноо</th>
+                      <th className="py-3 px-4 text-right">Баталгаажуулалт</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
-                    {filteredPayments.map((p) => (
-                      <tr key={p.orderNumber} className="hover:bg-white/5">
-                        <td className="py-3 px-4 font-mono font-bold text-white">{p.orderNumber}</td>
-                        <td className="py-3 px-4">
-                          <div className="font-bold text-white">{p.userName}</div>
-                          <div className="text-[10px] text-slate-400">{p.userEmail}</div>
-                        </td>
-                        <td className="py-3 px-4 font-semibold text-slate-300">{p.planName}</td>
-                        <td className="py-3 px-4 font-bold text-emerald-400">{formatCurrency(p.amount, locale, false)}</td>
-                        <td className="py-3 px-4 text-slate-400 text-[11px]">
-                          {p.paymentMethod === 'bank_transfer' ? 'Хаан Данс' : 'Wire.mn QPay'}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
-                              p.status === 'PAID'
-                                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                                : p.status === 'PENDING'
-                                ? 'bg-amber-500/20 text-amber-400'
-                                : 'bg-slate-500/20 text-slate-400'
-                            }`}
-                          >
-                            {p.status}
-                          </span>
-                        </td>
-                        <td className="py-3 px-4 text-right text-slate-400 text-[11px]">
-                          {formatDate(new Date(p.createdAt), locale)}
-                        </td>
-                      </tr>
-                    ))}
+                    {filteredPayments.map((p) => {
+                      const canVerifyBank =
+                        p.paymentMethod === 'bank_transfer' &&
+                        (p.status === 'PENDING_REVIEW' || p.status === 'PENDING');
+                      const isProcessing = processingPaymentId === (p.orderNumber || p.id);
+
+                      return (
+                        <tr key={p.orderNumber} className="hover:bg-white/5">
+                          <td className="py-3 px-4 font-mono font-bold text-white">{p.orderNumber}</td>
+                          <td className="py-3 px-4">
+                            <div className="font-bold text-white">{p.userName}</div>
+                            <div className="text-[10px] text-slate-400">{p.userEmail}</div>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="font-semibold text-slate-200">{p.planName}</div>
+                            <div className="font-bold text-emerald-400">{formatCurrency(p.amount, locale, false)}</div>
+                          </td>
+                          <td className="py-3 px-4 text-slate-300 text-[11px]">
+                            <div className="font-bold text-white">
+                              {p.paymentMethod === 'bank_transfer' ? 'Хаан Банк (Данс)' : 'Wire.mn QPay'}
+                            </div>
+                            {p.senderName && (
+                              <div className="text-[10px] text-amber-300 mt-0.5">
+                                Илгээгч: {p.senderName} ({p.senderPhone || '—'})
+                              </div>
+                            )}
+                            {p.bankTransferRef && (
+                              <div className="text-[10px] text-slate-400 font-mono">
+                                Лавлагаа: {p.bankTransferRef}
+                              </div>
+                            )}
+                            {p.rejectionReason && (
+                              <div className="text-[10px] text-rose-400">
+                                Шалтгаан: {p.rejectionReason}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
+                                p.status === 'PAID'
+                                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                                  : p.status === 'PENDING_REVIEW'
+                                  ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                                  : p.status === 'PENDING'
+                                  ? 'bg-amber-500/20 text-amber-400'
+                                  : p.status === 'REJECTED'
+                                  ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                                  : 'bg-slate-500/20 text-slate-400'
+                              }`}
+                            >
+                              {p.status}
+                            </span>
+                            {p.verifiedByAdminEmail && (
+                              <div className="text-[9px] text-slate-500 mt-0.5">
+                                {p.verifiedByAdminEmail}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-slate-400 text-[11px]">
+                            {formatDate(new Date(p.createdAt), locale)}
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            {canVerifyBank ? (
+                              <div className="flex items-center justify-end gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={isProcessing}
+                                  onClick={() => handleApprovePayment(p)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] cursor-pointer disabled:opacity-50"
+                                >
+                                  {isProcessing ? '...' : locale === 'en' ? 'Approve' : 'Батлах'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isProcessing}
+                                  onClick={() => {
+                                    setRejectPaymentModal(p);
+                                    setRejectReason('');
+                                  }}
+                                  className="px-2.5 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-300 font-bold text-[10px] cursor-pointer disabled:opacity-50"
+                                >
+                                  {locale === 'en' ? 'Reject' : 'Татгалзах'}
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-[10px] text-slate-500">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1693,7 +2150,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                         <td className="py-3 px-4 text-right">
                           <button
                             onClick={() => setSubAdjustModal({ userId: s.userId, userName: s.userName })}
-                            className="px-2.5 py-1 rounded bg-white/10 hover:bg-white/15 text-white text-[10px] font-bold"
+                            className="px-2.5 py-1 rounded bg-white/10 hover:bg-white/15 text-white text-[10px] font-bold cursor-pointer"
                           >
                             {tAdmin('adjustSubscription')}
                           </button>
@@ -1707,28 +2164,31 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           )}
 
           {/* ========================================================= */}
-          {/* 9. ANALYTICS & AUDIT LOGS */}
+          {/* 9. AUDIT LOGS (Dedicated Section) */}
           {/* ========================================================= */}
-          {activeSection === 'analytics' && (
+          {activeSection === 'audit-logs' && (
             <div className="space-y-6 animate-in fade-in">
               <div className="p-6 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-4">
-                <h3 className="text-sm font-black text-white flex items-center gap-2">
-                  <Shield className="w-4 h-4 text-rose-400" />
-                  <span>Админ Үйлдлийн Аудит Лог (Audit Trail)</span>
-                </h3>
+                <div className="flex items-center justify-between border-b border-white/10 pb-3">
+                  <h3 className="text-sm font-black text-white flex items-center gap-2">
+                    <Shield className="w-4 h-4 text-rose-400" />
+                    <span>Админ Үйлдлийн Аудит Лог (Audit Trail)</span>
+                  </h3>
+                  <span className="text-xs text-slate-400 font-bold">Нийт: {auditLogs.length}</span>
+                </div>
 
                 <div className="divide-y divide-white/5 text-xs">
                   {auditLogs.map((log: any) => (
-                    <div key={log.id} className="py-2.5 flex items-center justify-between gap-4">
+                    <div key={log.id} className="py-3 flex items-center justify-between gap-4">
                       <div>
                         <div className="font-bold text-white flex items-center gap-2">
-                          <span className="px-1.5 py-0.5 rounded bg-white/10 font-mono text-[10px] text-amber-400">
+                          <span className="px-2 py-0.5 rounded bg-white/10 font-mono text-[10px] text-amber-400">
                             {log.action}
                           </span>
                           <span>{log.target}</span>
                         </div>
-                        <div className="text-[11px] text-slate-400 mt-0.5">
-                          {log.details || '—'} · Админ: {log.adminEmail}
+                        <div className="text-[11px] text-slate-400 mt-1">
+                          {log.details || '—'} · Админ: <strong className="text-slate-300">{log.adminEmail}</strong>
                         </div>
                       </div>
                       <div className="text-right text-[10px] text-slate-500 shrink-0">
@@ -1737,7 +2197,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </div>
                   ))}
                   {auditLogs.length === 0 && (
-                    <div className="text-center py-6 text-slate-500">Одоогоор бүртгэгдсэн аудит лог байхгүй.</div>
+                    <div className="text-center py-8 text-slate-500">Одоогоор бүртгэгдсэн аудит лог байхгүй.</div>
                   )}
                 </div>
               </div>
@@ -1745,78 +2205,405 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           )}
 
           {/* ========================================================= */}
-          {/* 10. WEBSITE SETTINGS */}
+          {/* 10. STATISTICS / ANALYTICS */}
+          {/* ========================================================= */}
+          {activeSection === 'analytics' && (
+            <div className="space-y-6 animate-in fade-in">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Payment Channel & Plan Revenue Breakdown from Real MongoDB Records */}
+                <div className="p-6 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-4">
+                  <h3 className="text-sm font-black text-white flex items-center gap-2">
+                    <BarChart3 className="w-4 h-4 text-[#e5a93c]" />
+                    <span>Баталгаажсан Орлогын Задаргаа (PAID Transactions)</span>
+                  </h3>
+
+                  <div className="space-y-3 text-xs">
+                    {(['wire_qpay', 'bank_transfer'] as const).map((method) => {
+                      const methodPaid = paymentsList.filter((p) => p.status === 'PAID' && p.paymentMethod === method);
+                      const sum = methodPaid.reduce((acc, p) => acc + (p.amount || 0), 0);
+                      return (
+                        <div key={method} className="p-3.5 rounded-xl bg-white/5 border border-white/10 flex items-center justify-between">
+                          <div>
+                            <div className="font-bold text-white">
+                              {method === 'wire_qpay' ? 'Wire.mn QPay Шууд Төлбөр' : 'Хаан Банк Дансны Шилжүүлэг'}
+                            </div>
+                            <div className="text-[11px] text-slate-400">{methodPaid.length} баталгаажсан гүйлгээ</div>
+                          </div>
+                          <div className="text-sm font-black text-emerald-400">
+                            {formatCurrency(sum, locale, false)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Top Movies by Views */}
+                <div className="p-6 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-4">
+                  <h3 className="text-sm font-black text-white flex items-center gap-2">
+                    <TrendingUp className="w-4 h-4 text-emerald-400" />
+                    <span>Хамгийн их үзэлттэй кинонууд</span>
+                  </h3>
+
+                  <div className="divide-y divide-white/5 text-xs">
+                    {[...movies]
+                      .sort((a, b) => (b.views || 0) - (a.views || 0))
+                      .slice(0, 6)
+                      .map((m, i) => (
+                        <div key={m.id} className="py-2.5 flex items-center justify-between">
+                          <div className="flex items-center gap-2.5">
+                            <span className="w-5 h-5 rounded bg-white/10 flex items-center justify-center text-[10px] font-black text-[#e5a93c]">
+                              {i + 1}
+                            </span>
+                            <div>
+                              <div className="font-bold text-white">{m.titleMn || m.title?.mn}</div>
+                              <div className="text-[10px] text-slate-400">{m.quality} · ★ {m.rating}</div>
+                            </div>
+                          </div>
+                          <span className="font-mono font-bold text-slate-300">{m.views || 0} үзэлт</span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Webhook Events Ledger */}
+              <div className="p-6 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-4">
+                <h3 className="text-sm font-black text-white flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-sky-400" />
+                  <span>Wire.mn Webhook Мэдэгдлийн Түүх</span>
+                </h3>
+                <div className="divide-y divide-white/5 text-xs">
+                  {webhookEvents.slice(0, 10).map((ev: any, idx: number) => (
+                    <div key={ev.eventId || idx} className="py-2.5 flex items-center justify-between">
+                      <div>
+                        <span className="font-mono font-bold text-sky-300">{ev.type}</span>
+                        <span className="text-slate-400 ml-2 text-[11px]">ID: {ev.eventId}</span>
+                      </div>
+                      <span className="text-[10px] text-slate-500">
+                        {ev.processedAt ? formatDate(new Date(ev.processedAt), locale) : '—'}
+                      </span>
+                    </div>
+                  ))}
+                  {webhookEvents.length === 0 && (
+                    <div className="text-center py-6 text-slate-500">Одоогоор бүртгэгдсэн вебхүүк эвент байхгүй.</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ========================================================= */}
+          {/* 11. WEBSITE SETTINGS (Persisted in MongoDB) */}
           {/* ========================================================= */}
           {activeSection === 'settings' && (
-            <div className="max-w-2xl p-6 sm:p-8 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-6 animate-in fade-in">
+            <form
+              onSubmit={handleSaveSettings}
+              className="max-w-3xl p-6 sm:p-8 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-6 animate-in fade-in text-xs"
+            >
               <div className="border-b border-white/10 pb-4">
                 <h3 className="text-lg font-black text-white">{tAdmin('settingsNav')}</h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Платформын үндсэн тохиргоо, бүртгэлийн статус болон төлбөрийн гарц
+                  Платформын үндсэн тохиргоо, Hero кино, зарлал, гишүүнчлэлийн үнэ болон FAQ (MongoDB-д хадгалагдана)
                 </p>
               </div>
 
-              <div className="space-y-4 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-slate-400 mb-1">Сайтын нэр (Site Brand Name)</label>
+                  <label className="block text-slate-300 font-bold mb-1">Сайтын нэр (Site Brand Name)</label>
                   <input
                     type="text"
+                    required
                     value={siteSettings.siteName}
                     onChange={(e) => setSiteSettings({ ...siteSettings, siteName: e.target.value })}
-                    className="w-full px-3.5 py-2 rounded-xl bg-[#111827] border border-white/15 text-white"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
                   />
                 </div>
 
-                <div className="pt-2 space-y-3">
-                  <label className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
-                    <div>
-                      <div className="font-bold text-white">Шинэ хэрэглэгчийн бүртгэл (Allow Registrations)</div>
-                      <div className="text-[11px] text-slate-400">Шинээр бүртгүүлэхийг нээх эсвэл түр хаах</div>
-                    </div>
-                    <input
-                      type="checkbox"
-                      checked={siteSettings.allowRegistrations}
-                      onChange={(e) => setSiteSettings({ ...siteSettings, allowRegistrations: e.target.checked })}
-                      className="rounded text-[#e50914] w-4 h-4"
-                    />
-                  </label>
-
-                  <label className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
-                    <div>
-                      <div className="font-bold text-white">Засвар үйлчилгээний горим (Maintenance Mode)</div>
-                      <div className="text-[11px] text-slate-400">Сайтыг зөвхөн админ хэрэглэгчдэд нээлттэй байлгах</div>
-                    </div>
-                    <input
-                      type="checkbox"
-                      checked={siteSettings.maintenanceMode}
-                      onChange={(e) => setSiteSettings({ ...siteSettings, maintenanceMode: e.target.checked })}
-                      className="rounded text-[#e50914] w-4 h-4"
-                    />
-                  </label>
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">Үндсэн хэл (Default Language)</label>
+                  <select
+                    value={siteSettings.defaultLocale}
+                    onChange={(e) => setSiteSettings({ ...siteSettings, defaultLocale: e.target.value as 'mn' | 'en' })}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                  >
+                    <option value="mn">Монгол (MN)</option>
+                    <option value="en">English (EN)</option>
+                  </select>
                 </div>
-
-                <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center justify-between">
-                  <div>
-                    <div className="font-bold">Wire.mn & QPay Интеграцийн төлөв</div>
-                    <div className="text-[11px] text-emerald-400/80">HMAC-SHA256 гарын үсэгтэй шууд баталгаажуулалт идэвхтэй</div>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-black text-[10px]">
-                    CONNECTED
-                  </span>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => notify('success', 'Сайтын тохиргоо амжилттай хадгалагдлаа.')}
-                  className="w-full py-2.5 rounded-xl bg-[#e5a93c] hover:bg-amber-400 text-black font-extrabold text-xs cursor-pointer shadow-lg shadow-amber-950/40"
-                >
-                  Тохиргоог хадгалах
-                </button>
               </div>
+
+              {/* Hero Featured Movie Selector */}
+              <div>
+                <label className="block text-slate-300 font-bold mb-1">
+                  Нүүр хуудасны Hero Banner онцлох кино
+                </label>
+                <select
+                  value={siteSettings.featuredMovieId || ''}
+                  onChange={(e) => setSiteSettings({ ...siteSettings, featuredMovieId: e.target.value })}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                >
+                  <option value="">Автомат (Хамгийн эхний Featured кино)</option>
+                  {movies.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.titleMn || m.title?.mn} ({m.titleEn || m.title?.en})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Homepage Announcements */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">Нүүр хуудасны зарлал (MN)</label>
+                  <input
+                    type="text"
+                    value={siteSettings.announcementMn || ''}
+                    onChange={(e) => setSiteSettings({ ...siteSettings, announcementMn: e.target.value })}
+                    placeholder="Шинэ 4K кинонууд нэмэгдлээ..."
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">Homepage Announcement (EN)</label>
+                  <input
+                    type="text"
+                    value={siteSettings.announcementEn || ''}
+                    onChange={(e) => setSiteSettings({ ...siteSettings, announcementEn: e.target.value })}
+                    placeholder="New 4K AI movies added this week..."
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                  />
+                </div>
+              </div>
+
+              {/* Subscription Pricing Overrides */}
+              <div className="p-4 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                <div className="font-bold text-white">Гишүүнчлэлийн сарын төлбөр (MNT)</div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-slate-400 mb-1">Basic багц (₮)</label>
+                    <input
+                      type="number"
+                      value={siteSettings.subscriptionPrices?.basic ?? 9900}
+                      onChange={(e) =>
+                        setSiteSettings({
+                          ...siteSettings,
+                          subscriptionPrices: {
+                            ...siteSettings.subscriptionPrices,
+                            basic: Number(e.target.value)
+                          }
+                        })
+                      }
+                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">Standard VIP багц (₮)</label>
+                    <input
+                      type="number"
+                      value={siteSettings.subscriptionPrices?.standard ?? 14900}
+                      onChange={(e) =>
+                        setSiteSettings({
+                          ...siteSettings,
+                          subscriptionPrices: {
+                            ...siteSettings.subscriptionPrices,
+                            standard: Number(e.target.value)
+                          }
+                        })
+                      }
+                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 mb-1">Premium 4K багц (₮)</label>
+                    <input
+                      type="number"
+                      value={siteSettings.subscriptionPrices?.premium ?? 19900}
+                      onChange={(e) =>
+                        setSiteSettings({
+                          ...siteSettings,
+                          subscriptionPrices: {
+                            ...siteSettings.subscriptionPrices,
+                            premium: Number(e.target.value)
+                          }
+                        })
+                      }
+                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* System Toggles */}
+              <div className="space-y-3">
+                <label className="flex items-center justify-between p-3.5 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
+                  <div>
+                    <div className="font-bold text-white">Шинэ хэрэглэгчийн бүртгэл (Allow Registrations)</div>
+                    <div className="text-[11px] text-slate-400">Шинээр бүртгүүлэхийг нээх эсвэл түр хаах</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={siteSettings.allowRegistrations}
+                    onChange={(e) => setSiteSettings({ ...siteSettings, allowRegistrations: e.target.checked })}
+                    className="rounded text-[#e50914] w-4 h-4"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-3.5 rounded-xl bg-white/5 border border-white/10 cursor-pointer">
+                  <div>
+                    <div className="font-bold text-white">Засвар үйлчилгээний горим (Maintenance Mode)</div>
+                    <div className="text-[11px] text-slate-400">Сайтыг зөвхөн админ хэрэглэгчдэд нээлттэй байлгах</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={siteSettings.maintenanceMode}
+                    onChange={(e) => setSiteSettings({ ...siteSettings, maintenanceMode: e.target.checked })}
+                    className="rounded text-[#e50914] w-4 h-4"
+                  />
+                </label>
+              </div>
+
+              <button
+                type="submit"
+                disabled={savingSettings}
+                className="w-full py-3 rounded-xl bg-[#e5a93c] hover:bg-amber-400 text-black font-extrabold text-xs cursor-pointer shadow-lg shadow-amber-950/40 disabled:opacity-50"
+              >
+                {savingSettings ? 'Хадгалж байна...' : 'Тохиргоог хадгалах'}
+              </button>
+            </form>
+          )}
+
+          {/* ========================================================= */}
+          {/* 12. ADMIN PROFILE */}
+          {/* ========================================================= */}
+          {activeSection === 'profile' && (
+            <div className="max-w-2xl space-y-6 animate-in fade-in text-xs">
+              <form
+                onSubmit={handleUpdateAdminProfile}
+                className="p-6 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-4"
+              >
+                <h3 className="text-base font-black text-white border-b border-white/10 pb-3">
+                  Админ Профайл Мэдээлэл
+                </h3>
+                <div>
+                  <label className="block text-slate-400 mb-1">Имэйл хаяг</label>
+                  <input
+                    type="email"
+                    disabled
+                    value={currentUser?.email || ''}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827]/60 border border-white/10 text-slate-400"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">Админы нэр</label>
+                  <input
+                    type="text"
+                    required
+                    value={profileName}
+                    onChange={(e) => setProfileName(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={profileSaving}
+                  className="px-5 py-2.5 rounded-xl bg-[#e5a93c] hover:bg-amber-400 text-black font-extrabold cursor-pointer disabled:opacity-50"
+                >
+                  Нэр шинэчлэх
+                </button>
+              </form>
+
+              <form
+                onSubmit={handleChangeAdminPassword}
+                className="p-6 rounded-2xl bg-[#0f172a] border border-white/10 shadow-xl space-y-4"
+              >
+                <h3 className="text-base font-black text-white border-b border-white/10 pb-3">
+                  Нууц Үг Солих
+                </h3>
+                <div>
+                  <label className="block text-slate-300 font-bold mb-1">Одоогийн нууц үг</label>
+                  <input
+                    type="password"
+                    required
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                  />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-slate-300 font-bold mb-1">Шинэ нууц үг (8+ тэмдэгт)</label>
+                    <input
+                      type="password"
+                      required
+                      minLength={8}
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-300 font-bold mb-1">Шинэ нууц үг давтах</label>
+                    <input
+                      type="password"
+                      required
+                      minLength={8}
+                      value={confirmNewPassword}
+                      onChange={(e) => setConfirmNewPassword(e.target.value)}
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-[#111827] border border-white/15 text-white"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  disabled={profileSaving}
+                  className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-[#e50914] to-rose-700 text-white font-black cursor-pointer disabled:opacity-50"
+                >
+                  Нууц үг солих
+                </button>
+              </form>
             </div>
           )}
         </div>
       </main>
+
+      {/* Reject Bank Transfer Modal */}
+      {rejectPaymentModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-sm bg-[#0f172a] border border-white/15 rounded-2xl p-6 space-y-4 shadow-2xl text-xs">
+            <h3 className="text-base font-black text-white">Банкны шилжүүлэг татгалзах</h3>
+            <p className="text-slate-300">
+              Захиалга: <strong className="text-white font-mono">{rejectPaymentModal.orderNumber}</strong> ({rejectPaymentModal.userName})
+            </p>
+            <div>
+              <label className="block text-slate-400 mb-1">Татгалзсан шалтгаан:</label>
+              <input
+                type="text"
+                value={rejectReason}
+                onChange={(e) => setRejectReason(e.target.value)}
+                placeholder="Банкны хуулгаар гүйлгээ олдсонгүй"
+                className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setRejectPaymentModal(null)}
+                className="py-2 rounded-xl bg-white/10 text-white font-bold cursor-pointer"
+              >
+                Цуцлах
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmRejectPayment}
+                className="py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold cursor-pointer"
+              >
+                Татгалзах
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Delete Movie Confirmation Modal */}
       {deleteConfirmMovie && (
@@ -1832,13 +2619,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <div className="grid grid-cols-2 gap-2 pt-2">
               <button
                 onClick={() => setDeleteConfirmMovie(null)}
-                className="py-2 rounded-xl bg-white/10 text-white font-bold text-xs"
+                className="py-2 rounded-xl bg-white/10 text-white font-bold text-xs cursor-pointer"
               >
                 {locale === 'en' ? 'Cancel' : 'Цуцлах'}
               </button>
               <button
                 onClick={handleDeleteMovie}
-                className="py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs"
+                className="py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs cursor-pointer"
               >
                 {tAdmin('delete')}
               </button>
@@ -1887,13 +2674,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             <div className="grid grid-cols-2 gap-2 pt-2">
               <button
                 onClick={() => setSubAdjustModal(null)}
-                className="py-2 rounded-xl bg-white/10 text-white font-bold text-xs"
+                className="py-2 rounded-xl bg-white/10 text-white font-bold text-xs cursor-pointer"
               >
                 Цуцлах
               </button>
               <button
                 onClick={handleApplySubscriptionAdjust}
-                className="py-2 rounded-xl bg-gradient-to-r from-[#e50914] to-rose-700 text-white font-black text-xs shadow-md"
+                className="py-2 rounded-xl bg-gradient-to-r from-[#e50914] to-rose-700 text-white font-black text-xs shadow-md cursor-pointer"
               >
                 Хадгалах
               </button>

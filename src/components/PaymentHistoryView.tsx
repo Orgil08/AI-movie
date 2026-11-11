@@ -43,11 +43,25 @@ export const PaymentHistoryView: React.FC<PaymentHistoryViewProps> = ({ onRenewP
             <span>{tCommon('success')}</span>
           </span>
         );
+      case 'PENDING_REVIEW':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[10px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
+            <Clock className="w-3 h-3" />
+            <span>{locale === 'en' ? 'PENDING REVIEW' : 'Шалгагдаж буй'}</span>
+          </span>
+        );
       case 'PENDING':
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-[#e5a93c] border border-amber-500/30">
             <Clock className="w-3 h-3" />
             <span>{locale === 'en' ? 'PENDING' : 'Хүлээгдэж буй'}</span>
+          </span>
+        );
+      case 'REJECTED':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
+            <XCircle className="w-3 h-3" />
+            <span>{locale === 'en' ? 'REJECTED' : 'Татгалзсан'}</span>
           </span>
         );
       case 'EXPIRED':

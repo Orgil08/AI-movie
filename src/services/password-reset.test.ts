@@ -47,6 +47,9 @@ test('Password Reset - generates token, verifies validity, and resets password',
   const tokenResult = await Storage.createPasswordResetToken('enkhjin@aimovie.mn');
   assert.ok(tokenResult, 'Token result should be generated');
   assert.ok(tokenResult.token.length >= 32, 'Token should be a secure hex string');
+  assert.ok(tokenResult.tokenHash && tokenResult.tokenHash !== tokenResult.token, 'Token must be hashed with SHA-256');
+  assert.equal(memDb.passwordResetTokens.has(tokenResult.token), false, 'Plaintext token must NEVER be stored in DB');
+  assert.equal(memDb.passwordResetTokens.has(tokenResult.tokenHash), true, 'SHA-256 tokenHash must be stored in DB');
   assert.equal(tokenResult.email, 'enkhjin@aimovie.mn');
 
   // 2. Verify token

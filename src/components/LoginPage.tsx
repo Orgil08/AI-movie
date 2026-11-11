@@ -27,6 +27,42 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [successMsg, setSuccessMsg] = useState<string | null>(initialMessage);
   const [loading, setLoading] = useState(false);
   const [forgotModalOpen, setForgotModalOpen] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotStatus, setForgotStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  const handleForgotPasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!forgotEmail.trim()) return;
+    setForgotLoading(true);
+    setForgotStatus(null);
+    try {
+      const res = await fetch('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: forgotEmail.trim() })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setForgotStatus({
+          type: 'error',
+          message: locale === 'en' ? (data.messageEn || data.message || 'Failed to send reset link') : (data.message || 'Алдаа гарлаа')
+        });
+      } else {
+        setForgotStatus({
+          type: 'success',
+          message: locale === 'en' ? (data.messageEn || data.message) : data.message
+        });
+      }
+    } catch (err: any) {
+      setForgotStatus({
+        type: 'error',
+        message: err.message || tAuth('networkError')
+      });
+    } finally {
+      setForgotLoading(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -160,7 +196,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               </label>
               <button
                 type="button"
-                onClick={() => setForgotModalOpen(true)}
+                onClick={() => {
+                  setForgotEmail(email);
+                  setForgotStatus(null);
+                  setForgotModalOpen(true);
+                }}
                 className="text-[11px] text-[#e5a93c] hover:underline cursor-pointer"
               >
                 {tAuth('forgotPassword')}
@@ -234,19 +274,63 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       {/* Forgot Password Modal */}
       {forgotModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in">
-          <div className="w-full max-w-sm bg-[#0f172a] border border-white/15 rounded-2xl p-6 text-center space-y-4 shadow-2xl">
+          <div className="w-full max-w-sm bg-[#0f172a] border border-white/15 rounded-2xl p-6 space-y-4 shadow-2xl">
             <div className="w-12 h-12 rounded-full bg-[#e5a93c]/15 text-[#e5a93c] flex items-center justify-center mx-auto">
               <Shield className="w-6 h-6" />
             </div>
-            <h3 className="text-lg font-black text-white">{tAuth('forgotPasswordModalTitle')}</h3>
-            <p className="text-xs text-slate-300 leading-relaxed">
-              {tAuth('forgotPasswordModalDesc')}
-            </p>
-            <div className="p-3 rounded-xl bg-white/5 text-[11px] text-slate-400 text-left space-y-1">
-              <div>• Имэйл: <strong className="text-white">support@aimovie.mn</strong></div>
-              <div>• Утас: <strong className="text-white">+976 7711-2099</strong></div>
-              <div>• Эсвэл дээрх туршилтын бэлэн хаягуудыг ашиглана уу.</div>
+            <div className="text-center space-y-1">
+              <h3 className="text-lg font-black text-white">{tAuth('forgotPasswordModalTitle')}</h3>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                {locale === 'en'
+                  ? 'Enter your registered email address to receive a one-time password reset link.'
+                  : 'Бүртгэлтэй имэйл хаягаа оруулж нууц үг сэргээх нэг удаагийн холбоос авна уу.'}
+              </p>
             </div>
+
+            <form onSubmit={handleForgotPasswordSubmit} className="space-y-3">
+              <div>
+                <input
+                  type="email"
+                  required
+                  value={forgotEmail}
+                  onChange={(e) => setForgotEmail(e.target.value)}
+                  placeholder={tAuth('emailPlaceholder')}
+                  className="w-full bg-[#111827] border border-white/15 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-[#e5a93c]"
+                />
+              </div>
+
+              {forgotStatus && (
+                <div
+                  className={`p-3 rounded-xl text-xs flex items-start gap-2 ${
+                    forgotStatus.type === 'success'
+                      ? 'bg-emerald-950/50 border border-emerald-500/40 text-emerald-300'
+                      : 'bg-rose-950/50 border border-rose-500/40 text-rose-300'
+                  }`}
+                >
+                  {forgotStatus.type === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  )}
+                  <span>{forgotStatus.message}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={forgotLoading}
+                className="w-full py-2.5 rounded-xl bg-gradient-to-r from-[#e5a93c] to-amber-400 text-black font-extrabold text-xs cursor-pointer hover:brightness-110 transition disabled:opacity-50"
+              >
+                {forgotLoading
+                  ? locale === 'en'
+                    ? 'Sending...'
+                    : 'Илгээж байна...'
+                  : locale === 'en'
+                  ? 'Send Reset Link'
+                  : 'Сэргээх холбоос илгээх'}
+              </button>
+            </form>
+
             <button
               onClick={() => setForgotModalOpen(false)}
               className="w-full py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white font-bold text-xs cursor-pointer"

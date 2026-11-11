@@ -1,13 +1,16 @@
 import React, { useState } from 'react';
-import { X, Play, Plus, Check, Star, ShieldCheck, Film, Users, Layers, Award } from 'lucide-react';
+import { X, Play, Plus, Check, Star, Film } from 'lucide-react';
 import { Movie, getLocalizedMovieText } from '../data/movies.js';
 import { useLocale, useTranslations } from '../i18n/I18nContext.js';
+import { isMovieLockedForSubscription } from '../utils/accessControl.js';
 
 interface MovieDetailModalProps {
   movie: Movie;
   onClose: () => void;
   onPlay: (movie: Movie) => void;
   hasActiveSubscription: boolean;
+  subscription?: any;
+  userRole?: string;
   onOpenPricing: () => void;
   isInList: boolean;
   onToggleList: (movie: Movie) => void;
@@ -18,22 +21,36 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   onClose,
   onPlay,
   hasActiveSubscription,
+  subscription,
+  userRole,
   onOpenPricing,
   isInList,
   onToggleList
 }) => {
   const { locale } = useLocale();
   const tDetails = useTranslations('MovieDetails');
-  const [activeTab, setActiveTab] = useState<'overview' | 'episodes' | 'cast'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'trailer' | 'episodes' | 'cast'>('overview');
 
-  const title = getLocalizedMovieText(movie.title, locale, movie.titleMn);
-  const altTitle = locale === 'mn' ? movie.titleEn : movie.titleMn;
-  const synopsis = getLocalizedMovieText(movie.synopsis, locale, movie.descriptionMn);
+  const titleMn = movie.titleMn || getLocalizedMovieText(movie.title, 'mn', '');
+  const titleEn = movie.titleEn || getLocalizedMovieText(movie.title, 'en', '');
+  const title = getLocalizedMovieText(movie.title, locale, titleMn);
+  const altTitle = locale === 'mn' ? titleEn : titleMn;
+
+  const synopsisMn = (movie as any).synopsisMn || movie.descriptionMn || getLocalizedMovieText(movie.synopsis, 'mn', '');
+  const synopsisEn = (movie as any).synopsisEn || movie.descriptionEn || getLocalizedMovieText(movie.synopsis, 'en', '');
+  const synopsis = getLocalizedMovieText(movie.synopsis, locale, synopsisMn);
+
   const director = getLocalizedMovieText(movie.director, locale, movie.directorMn);
   const cast = getLocalizedMovieText(movie.cast, locale, movie.castMn);
-  const genre = getLocalizedMovieText(movie.genre, locale, movie.genreMn);
+  const genre =
+    getLocalizedMovieText(movie.genre, locale, movie.genreMn) ||
+    ((movie as any).genres || []).join(' • ');
+  const bannerSrc = movie.bannerUrl || (movie as any).backdropUrl || movie.posterUrl;
 
-  const isLocked = movie.isPremium && !hasActiveSubscription;
+  const isLocked =
+    subscription !== undefined
+      ? isMovieLockedForSubscription(movie, subscription, userRole)
+      : movie.isPremium && !hasActiveSubscription;
 
   const mockEpisodes = [
     {
@@ -62,6 +79,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     }
   ];
 
+  const minPlanPriceLabel =
+    movie.minPlan === 'premium'
+      ? 'PREMIUM VIP (19,900₮)'
+      : movie.minPlan === 'standard'
+      ? 'STANDARD VIP (14,900₮+)'
+      : 'BASIC VIP (9,900₮+)';
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/85 backdrop-blur-md overflow-y-auto animate-in fade-in duration-200">
       <div className="relative w-full max-w-4xl bg-[#0b0f19] border border-white/15 rounded-2xl overflow-hidden shadow-2xl shadow-black my-auto select-none">
@@ -77,7 +101,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         {/* Top Backdrop Header */}
         <div className="relative h-64 sm:h-80 w-full overflow-hidden bg-[#070a12]">
           <img
-            src={movie.bannerUrl}
+            src={bannerSrc}
             alt={title}
             referrerPolicy="no-referrer"
             className="w-full h-full object-cover object-center filter brightness-[0.6] contrast-[1.1]"
@@ -89,7 +113,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           <div className="absolute bottom-6 left-6 right-6 z-10 space-y-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="px-2.5 py-0.5 rounded-md bg-[#e5a93c] text-black font-extrabold text-[10px] uppercase">
-                {movie.isPremium ? 'SODON VIP' : 'FREE'}
+                {movie.isPremium ? `${(movie.minPlan || 'basic').toUpperCase()} VIP` : 'FREE'}
               </span>
               <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-black/60 backdrop-blur-md text-[#e5a93c] border border-[#e5a93c]/30 text-xs font-bold">
                 <Star className="w-3.5 h-3.5 fill-[#e5a93c]" />
@@ -110,7 +134,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               {title}
             </h2>
             <div className="text-xs sm:text-sm text-slate-400 font-medium">
-              {genre} · {altTitle}
+              {genre} {altTitle ? `· ${altTitle}` : ''}
             </div>
 
             {/* Quick action buttons */}
@@ -123,8 +147,22 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-[#e5a93c] to-amber-400 text-black font-extrabold text-sm flex items-center gap-2 hover:brightness-110 transition shadow-lg cursor-pointer"
               >
                 <Play className="w-4 h-4 fill-black" />
-                <span>{!isLocked ? tDetails('playMovie') : `${tDetails('playMovie')} (VIP)`}</span>
+                <span>
+                  {!isLocked
+                    ? tDetails('playMovie')
+                    : `${tDetails('playMovie')} (${(movie.minPlan || 'basic').toUpperCase()} VIP)`}
+                </span>
               </button>
+
+              {movie.trailerUrl && (
+                <button
+                  onClick={() => setActiveTab('trailer')}
+                  className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white border border-white/15 text-sm font-semibold flex items-center gap-2 transition cursor-pointer"
+                >
+                  <Film className="w-4 h-4 text-[#e5a93c]" />
+                  <span>{locale === 'en' ? 'Watch Trailer' : 'Трейлер үзэх'}</span>
+                </button>
+              )}
 
               <button
                 onClick={() => onToggleList(movie)}
@@ -165,6 +203,18 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           >
             {tDetails('overviewTab')}
           </button>
+          {movie.trailerUrl && (
+            <button
+              onClick={() => setActiveTab('trailer')}
+              className={`py-3.5 border-b-2 transition cursor-pointer ${
+                activeTab === 'trailer'
+                  ? 'border-[#e5a93c] text-[#e5a93c]'
+                  : 'border-transparent text-slate-400 hover:text-white'
+              }`}
+            >
+              {locale === 'en' ? 'Trailer' : 'Трейлер'}
+            </button>
+          )}
           <button
             onClick={() => setActiveTab('episodes')}
             className={`py-3.5 border-b-2 transition cursor-pointer ${
@@ -199,6 +249,15 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   {synopsis}
                 </p>
 
+                {synopsisMn && synopsisEn && synopsisMn !== synopsisEn && (
+                  <div className="pt-2 border-t border-white/10 text-xs text-slate-400">
+                    <span className="font-bold text-slate-300 block mb-1">
+                      {locale === 'mn' ? 'English Synopsis:' : 'Монгол тайлбар:'}
+                    </span>
+                    <p>{locale === 'mn' ? synopsisEn : synopsisMn}</p>
+                  </div>
+                )}
+
                 <div className="p-3.5 rounded-xl bg-white/5 border border-white/10 flex items-center gap-3">
                   <Film className="w-5 h-5 text-[#e5a93c] shrink-0" />
                   <div className="text-xs text-slate-300">
@@ -214,24 +273,45 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               <div className="space-y-3.5 text-xs bg-[#111827] p-4 rounded-xl border border-white/10">
                 <div>
                   <span className="text-slate-500 uppercase tracking-wider text-[10px] block font-bold">
+                    {locale === 'en' ? 'Titles (MN / EN)' : 'Нэр (МН / EN)'}
+                  </span>
+                  <span className="text-white font-medium mt-0.5 block">
+                    {titleMn} / {titleEn}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 uppercase tracking-wider text-[10px] block font-bold">
                     {tDetails('director')}
                   </span>
-                  <span className="text-white font-medium mt-0.5 block">{director}</span>
+                  <span className="text-white font-medium mt-0.5 block">{director || '—'}</span>
                 </div>
                 <div>
                   <span className="text-slate-500 uppercase tracking-wider text-[10px] block font-bold">
                     {tDetails('cast')}
                   </span>
-                  <span className="text-white font-medium mt-0.5 block">{cast}</span>
+                  <span className="text-white font-medium mt-0.5 block">{cast || '—'}</span>
                 </div>
                 <div>
                   <span className="text-slate-500 uppercase tracking-wider text-[10px] block font-bold">
                     {tDetails('minPlanRequired')}
                   </span>
                   <span className="text-[#e5a93c] font-bold mt-0.5 block uppercase">
-                    {movie.minPlan} VIP (9,900₮+)
+                    {movie.isPremium ? minPlanPriceLabel : locale === 'en' ? 'FREE ACCESS' : 'ҮНЭГҮЙ'}
                   </span>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'trailer' && movie.trailerUrl && (
+            <div className="space-y-3">
+              <div className="aspect-video w-full rounded-xl overflow-hidden bg-black border border-white/10">
+                <video
+                  src={movie.trailerUrl}
+                  controls
+                  autoPlay
+                  className="w-full h-full object-contain"
+                />
               </div>
             </div>
           )}
@@ -280,13 +360,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                 <div className="p-3.5 rounded-xl bg-[#111827] border border-white/10">
-                  <div className="text-white font-bold">{director}</div>
+                  <div className="text-white font-bold">{director || 'SODON AI Studio'}</div>
                   <div className="text-slate-400 text-[11px] mt-0.5">
                     {locale === 'en' ? 'Lead Neural Director & Screenplay' : 'Ерөнхий AI Найруулагч'}
                   </div>
                 </div>
                 <div className="p-3.5 rounded-xl bg-[#111827] border border-white/10">
-                  <div className="text-white font-bold">{cast}</div>
+                  <div className="text-white font-bold">{cast || 'Synthetic Ensemble'}</div>
                   <div className="text-slate-400 text-[11px] mt-0.5">
                     {locale === 'en' ? 'Synthetic Neural Performers' : 'AI Синтетик жүжигчид'}
                   </div>

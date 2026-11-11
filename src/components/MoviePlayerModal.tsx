@@ -66,14 +66,15 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
     setAccessDenied(null);
 
     // Call server-side verification endpoint
-    fetch(`/api/movies/${movie.id}/stream`)
+    fetch(`/api/movies/${movie.id}/stream`, { credentials: 'same-origin' })
       .then(async (res) => {
-        if (res.status === 403) {
-          const errData = await res.json();
+        if (res.status === 401 || res.status === 403) {
+          const errData = await res.json().catch(() => ({}));
           if (isMounted) {
-            setAccessDenied(
-              errData.message || (locale === 'en' ? 'Active subscription required for 4K streaming.' : 'Энэ киног үзэхийн тулд идэвхтэй гишүүнчлэл шаардлагатай.')
-            );
+            const msg = locale === 'en'
+              ? (errData.messageEn || errData.message || 'Active subscription required for 4K streaming.')
+              : (errData.message || 'Энэ киног үзэхийн тулд идэвхтэй гишүүнчлэл шаардлагатай.');
+            setAccessDenied(msg);
             setLoading(false);
           }
           return;
@@ -99,7 +100,7 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [movie]);
+  }, [movie, locale]);
 
   const movieDurationSeconds = movie ? parseDurationToSeconds(movie.duration) : 7200;
 
@@ -205,7 +206,7 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
               </h2>
 
               <p className="text-sm text-slate-300 max-w-md mt-2 leading-relaxed">
-                {tPlayer('lockSubtitle')}
+                {accessDenied || tPlayer('lockSubtitle')}
               </p>
 
               <div className="flex flex-col sm:flex-row items-center gap-3 mt-6">
@@ -296,7 +297,7 @@ export const MoviePlayerModal: React.FC<MoviePlayerModalProps> = ({
           <p className="text-sm text-slate-300 leading-relaxed">{synopsis}</p>
 
           <div className="flex flex-wrap gap-2 pt-1">
-            {movie.tags.map((tag, idx) => (
+            {(movie.tags && movie.tags.length > 0 ? movie.tags : movie.genres || []).map((tag, idx) => (
               <span
                 key={idx}
                 className="px-2.5 py-1 rounded-md text-xs font-medium bg-white/5 text-slate-400 border border-white/10"

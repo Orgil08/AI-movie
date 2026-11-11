@@ -1,13 +1,16 @@
 import React from 'react';
-import { Play, Lock, Star, ShieldCheck, Film } from 'lucide-react';
+import { Play, Lock, Star } from 'lucide-react';
 import { Movie, getLocalizedMovieText } from '../data/movies.js';
 import { useLocale, useTranslations } from '../i18n/I18nContext.js';
+import { isMovieLockedForSubscription } from '../utils/accessControl.js';
 
 interface MovieRowProps {
   title: string;
   subtitle?: string;
   movies: Movie[];
   hasActiveSubscription: boolean;
+  subscription?: any;
+  userRole?: string;
   onPlay: (movie: Movie) => void;
   onSelect: (movie: Movie) => void;
   onOpenPricing?: () => void;
@@ -18,12 +21,16 @@ export const MovieRow: React.FC<MovieRowProps> = ({
   subtitle,
   movies,
   hasActiveSubscription,
+  subscription,
+  userRole,
   onPlay,
   onSelect,
   onOpenPricing
 }) => {
   const { locale } = useLocale();
   const tMovies = useTranslations('Movies');
+
+  if (!movies || movies.length === 0) return null;
 
   return (
     <section className="py-7 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1920px] mx-auto">
@@ -42,9 +49,14 @@ export const MovieRow: React.FC<MovieRowProps> = ({
 
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 sm:gap-5">
         {movies.map((movie) => {
-          const isLocked = movie.isPremium && !hasActiveSubscription;
+          const isLocked =
+            subscription !== undefined
+              ? isMovieLockedForSubscription(movie, subscription, userRole)
+              : movie.isPremium && !hasActiveSubscription;
           const movieTitle = getLocalizedMovieText(movie.title, locale, movie.titleMn);
-          const genre = getLocalizedMovieText(movie.genre, locale, movie.genreMn);
+          const genre =
+            getLocalizedMovieText(movie.genre, locale, movie.genreMn) ||
+            ((movie as any).genres || []).join(' • ');
 
           return (
             <div
@@ -61,7 +73,6 @@ export const MovieRow: React.FC<MovieRowProps> = ({
                   className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-500 ease-out"
                   loading="lazy"
                   onError={(e) => {
-                    // Fallback to stylized SVG/CSS frame
                     (e.target as HTMLElement).style.display = 'none';
                   }}
                 />
@@ -70,7 +81,7 @@ export const MovieRow: React.FC<MovieRowProps> = ({
                 <div className="absolute top-2 left-2 flex flex-col gap-1 z-10">
                   {movie.isPremium ? (
                     <span className="px-2 py-0.5 text-[9px] font-extrabold uppercase rounded-md bg-[#e5a93c] text-black shadow-md tracking-wider">
-                      VIP
+                      {(movie.minPlan || 'VIP').toUpperCase()}
                     </span>
                   ) : (
                     <span className="px-2 py-0.5 text-[9px] font-extrabold uppercase rounded-md bg-emerald-500 text-black shadow-md tracking-wider">
@@ -86,7 +97,7 @@ export const MovieRow: React.FC<MovieRowProps> = ({
                   </span>
                 </div>
 
-                {/* Lock Overlay when Premium and Unsubscribed */}
+                {/* Lock Overlay when Premium and Insufficient Plan */}
                 {isLocked && (
                   <div
                     className="absolute inset-0 bg-black/75 backdrop-blur-[2px] flex flex-col items-center justify-center p-3 text-center transition-opacity"
@@ -103,7 +114,10 @@ export const MovieRow: React.FC<MovieRowProps> = ({
                     <span className="text-[11px] font-bold text-white uppercase tracking-wider">
                       {tMovies('premiumRequired')}
                     </span>
-                    <span className="text-[10px] text-[#e5a93c] font-medium mt-1 underline">
+                    <span className="text-[10px] text-[#e5a93c] font-bold mt-0.5 uppercase">
+                      {(movie.minPlan || 'basic').toUpperCase()}+ БАГЦ
+                    </span>
+                    <span className="text-[10px] text-slate-300 font-medium mt-1 underline">
                       QPay / Хаан Банк
                     </span>
                   </div>

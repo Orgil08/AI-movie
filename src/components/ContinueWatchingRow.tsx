@@ -1,12 +1,16 @@
 import React from 'react';
-import { Play, X, Clock, Lock, Sparkles, RotateCcw } from 'lucide-react';
-import { Movie, MOVIES, getLocalizedMovieText } from '../data/movies.js';
+import { Play, X, Clock, Lock } from 'lucide-react';
+import { Movie, getLocalizedMovieText } from '../data/movies.js';
 import { useLocale, useTranslations } from '../i18n/I18nContext.js';
 import { WatchProgress, formatRemainingTime, formatTimestamp } from '../utils/watchProgress.js';
+import { isMovieLockedForSubscription } from '../utils/accessControl.js';
 
 interface ContinueWatchingRowProps {
   progressList: WatchProgress[];
+  movies: Movie[];
   hasActiveSubscription: boolean;
+  subscription?: any;
+  userRole?: string;
   onResume: (movie: Movie, initialTime: number) => void;
   onSelect: (movie: Movie) => void;
   onRemove: (movieId: string) => void;
@@ -15,7 +19,10 @@ interface ContinueWatchingRowProps {
 
 export const ContinueWatchingRow: React.FC<ContinueWatchingRowProps> = ({
   progressList,
+  movies,
   hasActiveSubscription,
+  subscription,
+  userRole,
   onResume,
   onSelect,
   onRemove,
@@ -25,14 +32,14 @@ export const ContinueWatchingRow: React.FC<ContinueWatchingRowProps> = ({
   const tHome = useTranslations('HomePage');
   const tMovies = useTranslations('Movies');
 
-  if (!progressList || progressList.length === 0) {
+  if (!progressList || progressList.length === 0 || !movies || movies.length === 0) {
     return null;
   }
 
-  // Map progress items to movie records
+  // Map progress items to live movie records from MongoDB API
   const itemsWithMovies = progressList
     .map((progress) => {
-      const movie = MOVIES.find((m) => m.id === progress.movieId);
+      const movie = movies.find((m) => m.id === progress.movieId || (m as any).slug === progress.movieId);
       return movie ? { progress, movie } : null;
     })
     .filter((item): item is { progress: WatchProgress; movie: Movie } => item !== null);
@@ -61,12 +68,18 @@ export const ContinueWatchingRow: React.FC<ContinueWatchingRowProps> = ({
       {/* Grid of Continue Watching Cards (16:9 Cinematic Landscape) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 sm:gap-5">
         {itemsWithMovies.map(({ progress, movie }) => {
-          const isLocked = movie.isPremium && !hasActiveSubscription;
+          const isLocked =
+            subscription !== undefined
+              ? isMovieLockedForSubscription(movie, subscription, userRole)
+              : movie.isPremium && !hasActiveSubscription;
           const movieTitle = getLocalizedMovieText(movie.title, locale, movie.titleMn);
-          const genre = getLocalizedMovieText(movie.genre, locale, movie.genreMn);
+          const genre =
+            getLocalizedMovieText(movie.genre, locale, movie.genreMn) ||
+            ((movie as any).genres || []).join(' • ');
           const remainingText = formatRemainingTime(progress.currentTime, progress.duration, locale as any);
           const currentTimestamp = formatTimestamp(progress.currentTime);
           const totalTimestamp = formatTimestamp(progress.duration);
+          const thumbSrc = movie.bannerUrl || (movie as any).backdropUrl || movie.posterUrl;
 
           return (
             <div
@@ -83,7 +96,7 @@ export const ContinueWatchingRow: React.FC<ContinueWatchingRowProps> = ({
               {/* Landscape Thumbnail 16:9 */}
               <div className="relative aspect-video w-full overflow-hidden bg-[#070a12]">
                 <img
-                  src={movie.bannerUrl || movie.posterUrl}
+                  src={thumbSrc}
                   alt={movieTitle}
                   referrerPolicy="no-referrer"
                   className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-500 ease-out"
@@ -97,7 +110,7 @@ export const ContinueWatchingRow: React.FC<ContinueWatchingRowProps> = ({
                 <div className="absolute top-2 left-2 flex items-center gap-1.5 z-20">
                   {movie.isPremium ? (
                     <span className="px-2 py-0.5 text-[9px] font-extrabold uppercase rounded-md bg-[#e5a93c] text-black shadow-md tracking-wider">
-                      VIP
+                      {(movie.minPlan || 'VIP').toUpperCase()}
                     </span>
                   ) : (
                     <span className="px-2 py-0.5 text-[9px] font-extrabold uppercase rounded-md bg-emerald-500 text-black shadow-md tracking-wider">

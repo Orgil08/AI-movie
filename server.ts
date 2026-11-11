@@ -8,9 +8,9 @@ import { Storage, connectDB } from './src/db/storage.js';
 import { defaultWireService, WireService } from './src/services/wire.service.js';
 import { SUBSCRIPTION_PLANS, isValidPlanId, getPlanById } from './src/config/subscription-plans.js';
 import { BANK_TRANSFER_DETAILS } from './src/config/bank-details.js';
-import { MOVIES, getMovieById } from './src/data/movies.js';
 import { hashPassword, verifyPassword } from './src/utils/crypto.js';
 import { createSignedSessionToken, safeStringEqual, verifySignedSessionToken } from './src/utils/session.js';
+import { checkMovieAccess } from './src/utils/accessControl.js';
 import { getPageMetadata } from './src/i18n/seo.js';
 import { getLocaleFromPath } from './src/i18n/routing.js';
 import {
@@ -44,6 +44,18 @@ function getAuthSecret(): string {
     throw new Error('AUTH_SECRET must be configured in production.');
   }
   return 'local-development-only-ai-movie-session-secret';
+}
+
+export function isCloudinaryConfigured(): boolean {
+  return Boolean(
+    process.env.CLOUDINARY_CLOUD_NAME?.trim() &&
+      process.env.CLOUDINARY_API_KEY?.trim() &&
+      process.env.CLOUDINARY_API_SECRET?.trim()
+  );
+}
+
+export function isEmailServiceConfigured(): boolean {
+  return Boolean(process.env.RESEND_API_KEY?.trim() && process.env.EMAIL_FROM?.trim());
 }
 
 function readCookie(req: Request, cookieName: string): string | null {
@@ -84,7 +96,10 @@ function requireCsrf(req: Request, res: Response, next: NextFunction): void {
   const cookieToken = readCookie(req, CSRF_COOKIE);
   const requestToken = (req.get('x-csrf-token') || req.body?.csrfToken || '').toString();
   if (!requestToken) {
-    res.status(403).json({ error: 'CSRF_VALIDATION_FAILED', message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.' });
+    res.status(403).json({
+      error: 'CSRF_VALIDATION_FAILED',
+      message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.'
+    });
     return;
   }
 
@@ -93,7 +108,10 @@ function requireCsrf(req: Request, res: Response, next: NextFunction): void {
   const signatureMatches = Boolean(signedClaims && signedClaims.userId === 'csrf');
 
   if (!cookieMatches && !signatureMatches) {
-    res.status(403).json({ error: 'CSRF_VALIDATION_FAILED', message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.' });
+    res.status(403).json({
+      error: 'CSRF_VALIDATION_FAILED',
+      message: 'Хүсэлтийн аюулгүй байдлын шалгалт амжилтгүй боллоо. Дахин оролдоно уу.'
+    });
     return;
   }
   next();
@@ -127,31 +145,41 @@ async function getAuthenticatedUser(req: Request): Promise<AuthenticatedUser | n
 
 // Server-side authentication guard for user endpoints
 async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const user = await getAuthenticatedUser(req);
-  if (!user) {
-    return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Нэвтэрч орно уу.' });
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Нэвтэрч орно уу.' });
+    }
+    if (user.status === 'suspended') {
+      return res.status(403).json({ error: 'ACCOUNT_SUSPENDED', message: 'Таны бүртгэл түр түдгэлзсэн байна.' });
+    }
+    (req as any).user = user;
+    next();
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
-  if (user.status === 'suspended') {
-    return res.status(403).json({ error: 'ACCOUNT_SUSPENDED', message: 'Таны бүртгэл түр түдгэлзсэн байна.' });
-  }
-  (req as any).user = user;
-  next();
 }
 
 // Server-side administrator guard for Admin Panel endpoints
 async function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  const user = await getAuthenticatedUser(req);
-  if (!user) {
-    return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Администратор хаягаар нэвтэрнэ үү.' });
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Администратор хаягаар нэвтэрнэ үү.' });
+    }
+    if (user.role !== 'admin') {
+      return res.status(403).json({ error: 'FORBIDDEN_ADMIN_ONLY', message: 'Зөвхөн администратор хандах эрхтэй.' });
+    }
+    if (user.status === 'suspended') {
+      return res.status(403).json({ error: 'ACCOUNT_SUSPENDED', message: 'Таны администратор бүртгэл түдгэлзсэн байна.' });
+    }
+    (req as any).user = user;
+    next();
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
-  if (user.role !== 'admin') {
-    return res.status(403).json({ error: 'FORBIDDEN_ADMIN_ONLY', message: 'Зөвхөн администратор хандах эрхтэй.' });
-  }
-  if (user.status === 'suspended') {
-    return res.status(403).json({ error: 'ACCOUNT_SUSPENDED', message: 'Таны администратор бүртгэл түдгэлзсэн байна.' });
-  }
-  (req as any).user = user;
-  next();
 }
 
 // In-memory sliding window rate limiter for auth endpoints
@@ -179,7 +207,7 @@ function getBaseUrl(req: Request): string {
   return `${protocol}://${host}`;
 }
 
-// Fail closed on Vercel/production: never silently authenticate against the
+// Fail closed on Vercel/production: never silently authenticate against or read from the
 // seeded in-memory development database when MongoDB is unavailable.
 app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
   if (!isProduction) return next();
@@ -202,12 +230,18 @@ app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const connected = await connectDB();
     if (!connected) {
-      return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).' });
+      return res.status(503).json({
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).'
+      });
     }
     return next();
   } catch (error) {
     console.error('[API] Production database initialization failed:', error);
-    return res.status(503).json({ error: 'DATABASE_UNAVAILABLE', message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).' });
+    return res.status(503).json({
+      error: 'DATABASE_UNAVAILABLE',
+      message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).'
+    });
   }
 });
 
@@ -222,16 +256,13 @@ app.use(
   })
 );
 
-// Standard JSON parser for all other routes
-app.use(express.json());
+// Standard JSON parser for all other routes (10MB limit for Base64 image payloads before validation)
+app.use(express.json({ limit: '10mb' }));
 
 // -------------------------------------------------------------
-// 2. Authentication Endpoints (Sign In, Sign Up, Sign Out, Me)
+// 2. Authentication Endpoints (Sign In, Sign Up, Sign Out, Me, Password Reset)
 // -------------------------------------------------------------
 
-// Custom Express authentication discovery/session endpoints. This project
-// does not use NextAuth/Auth.js; these expose the existing credentials auth
-// contract as JSON for health checks and clients that probe these URLs.
 app.get('/api/auth/providers', (_req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store');
   return res.json({
@@ -276,36 +307,41 @@ app.get('/api/auth/session', async (req: Request, res: Response) => {
 
 // Context Endpoint: returns current user and active subscription
 app.get('/api/auth/me', async (req: Request, res: Response) => {
-  const user = await getAuthenticatedUser(req);
-  if (!user) {
-    return res.json({
-      user: null,
-      subscription: null,
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.json({
+        user: null,
+        subscription: null,
+        wireConfigured: defaultWireService.isConfigured()
+      });
+    }
+
+    const subscription = await Storage.getActiveSubscription(user.id);
+    const plan = subscription ? getPlanById(subscription.planId) : null;
+
+    let daysRemaining = 0;
+    if (subscription) {
+      const end = new Date(subscription.endDate).getTime();
+      const diff = end - Date.now();
+      daysRemaining = Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
+    }
+
+    res.json({
+      user,
+      subscription: subscription
+        ? {
+            ...subscription,
+            plan,
+            daysRemaining
+          }
+        : null,
       wireConfigured: defaultWireService.isConfigured()
     });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
-
-  const subscription = await Storage.getActiveSubscription(user.id);
-  const plan = subscription ? getPlanById(subscription.planId) : null;
-
-  let daysRemaining = 0;
-  if (subscription) {
-    const end = new Date(subscription.endDate).getTime();
-    const diff = end - Date.now();
-    daysRemaining = Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
-  }
-
-  res.json({
-    user,
-    subscription: subscription
-      ? {
-          ...subscription,
-          plan,
-          daysRemaining
-        }
-      : null,
-    wireConfigured: defaultWireService.isConfigured()
-  });
 });
 
 // User Registration: Sign Up with Zod validation, role="user" strict enforcement, bcrypt hashing
@@ -316,6 +352,15 @@ app.post('/api/auth/register', requireCsrf, async (req: Request, res: Response) 
       return res.status(429).json({
         error: 'RATE_LIMIT_EXCEEDED',
         message: 'Хэт олон бүртгүүлэх оролдлого хийсэн байна. Түр хүлээнэ үү.'
+      });
+    }
+
+    // Check if registrations are allowed in Website Settings
+    const settings = await Storage.getWebsiteSettings();
+    if (settings && settings.allowRegistrations === false) {
+      return res.status(403).json({
+        error: 'REGISTRATIONS_DISABLED',
+        message: 'Шинэ хэрэглэгчийн бүртгэл түр хаалттай байна. Администраторт хандана уу.'
       });
     }
 
@@ -361,7 +406,8 @@ app.post('/api/auth/register', requireCsrf, async (req: Request, res: Response) 
     });
   } catch (err: any) {
     console.error('[Auth/Register] Error:', err);
-    return res.status(500).json({ error: 'SERVER_ERROR', message: 'Бүртгүүлэхэд алдаа гарлаа.' });
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message || 'Бүртгүүлэхэд алдаа гарлаа.' });
   }
 });
 
@@ -408,10 +454,9 @@ app.post('/api/auth/login', requireCsrf, async (req: Request, res: Response) => 
       });
     }
 
-    // Update last login timestamp
     await Storage.updateUser(user.id!, { lastLoginAt: new Date() });
 
-    const maxAge = remember ? 30 * 24 * 60 * 60 : 24 * 60 * 60; // 30 days or session day
+    const maxAge = remember ? 30 * 24 * 60 * 60 : 24 * 60 * 60;
     setSessionCookie(res, user.id!, maxAge);
 
     const subscription = await Storage.getActiveSubscription(user.id!);
@@ -429,7 +474,165 @@ app.post('/api/auth/login', requireCsrf, async (req: Request, res: Response) => 
     });
   } catch (err: any) {
     console.error('[Auth/Login] Error:', err);
-    return res.status(500).json({ error: 'SERVER_ERROR', message: 'Нэвтрэхэд алдаа гарлаа.' });
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message || 'Нэвтрэхэд алдаа гарлаа.' });
+  }
+});
+
+// Phase 6: Forgot Password (Resend email integration + SHA-256 token hashing)
+app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
+  try {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(`forgot_${clientIp}`, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({
+        error: 'RATE_LIMIT_EXCEEDED',
+        message: 'Хэт олон удаа нууц үг сэргээх хүсэлт илгээсэн байна. 15 минутын дараа дахин оролдоно уу.'
+      });
+    }
+
+    const email = (req.body?.email || '').toString().trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: 'Имэйл хаягаа зөв оруулна уу.'
+      });
+    }
+
+    // Honest configuration check: never pretend an email was sent when Resend is unconfigured
+    if (!isEmailServiceConfigured()) {
+      return res.status(503).json({
+        error: 'EMAIL_SERVICE_NOT_CONFIGURED',
+        message:
+          'Имэйл илгээх сервис (RESEND_API_KEY, EMAIL_FROM) тохируулаагүй байна. Системийн администраторт хандана уу.'
+      });
+    }
+
+    const genericSuccessMessage =
+      'Хэрэв уг имэйл хаяг системд бүртгэлтэй бол нууц үг сэргээх холбоос таны имэйл рүү илгээгдлээ.';
+
+    const tokenData = await Storage.createPasswordResetToken(email);
+    if (!tokenData) {
+      // Never reveal whether an email exists in the system
+      return res.json({
+        success: true,
+        message: genericSuccessMessage
+      });
+    }
+
+    const baseUrl = getBaseUrl(req);
+    const resetUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(tokenData.token)}`;
+
+    const resendRes = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY!.trim()}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: process.env.EMAIL_FROM!.trim(),
+        to: [tokenData.email],
+        subject: 'SODON AI MOVIE — Нууц үг сэргээх холбоос / Password Reset',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; background: #0b0f19; color: #ffffff; border-radius: 12px;">
+            <h2 style="color: #e5a93c; margin-top: 0;">SODON AI MOVIE</h2>
+            <p>Таны бүртгэлд нууц үг шинэчлэх хүсэлт ирлээ. Доорх товч дээр дарж шинэ нууц үгээ тохируулна уу (Холбоос 1 цагийн хугацаанд хүчинтэй):</p>
+            <p style="margin: 24px 0;">
+              <a href="${resetUrl}" style="background: #e50914; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold;">Нууц үг шинэчлэх</a>
+            </p>
+            <p style="font-size: 12px; color: #94a3b8;">Хэрэв та энэ хүсэлтийг илгээгээгүй бол энэхүү имэйлийг үл хэрэгсэнэ үү.</p>
+          </div>
+        `
+      })
+    });
+
+    if (!resendRes.ok) {
+      const errBody = await resendRes.text();
+      console.error('[Auth/ForgotPassword] Resend API error:', errBody);
+      return res.status(502).json({
+        error: 'EMAIL_DELIVERY_FAILED',
+        message: 'Имэйл илгээхэд алдаа гарлаа. Түр хүлээгээд дахин оролдоно уу.'
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: genericSuccessMessage
+    });
+  } catch (err: any) {
+    console.error('[Auth/ForgotPassword] Error:', err);
+    const status = err?.statusCode || 500;
+    return res.status(status).json({
+      error: err?.code || 'SERVER_ERROR',
+      message: err.message || 'Нууц үг сэргээх хүсэлт илгээхэд алдаа гарлаа.'
+    });
+  }
+});
+
+// Verify Password Reset Token (GET /api/auth/verify-reset-token?token=...)
+app.get('/api/auth/verify-reset-token', async (req: Request, res: Response) => {
+  try {
+    const token = (req.query.token || '').toString().trim();
+    const verification = await Storage.verifyPasswordResetToken(token);
+    if (!verification.valid) {
+      return res.status(400).json({
+        valid: false,
+        error: 'INVALID_OR_EXPIRED_TOKEN',
+        message: verification.message || 'Нууц үг сэргээх холбоос хүчингүй эсвэл хугацаа нь дууссан байна.'
+      });
+    }
+    return res.json({
+      valid: true,
+      email: verification.email
+    });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ valid: false, error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// Reset Password with Token (POST /api/auth/reset-password)
+app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
+  try {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(`reset_pw_${clientIp}`, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({
+        error: 'RATE_LIMIT_EXCEEDED',
+        message: 'Хэт олон оролдлого хийсэн байна. Түр хүлээнэ үү.'
+      });
+    }
+
+    const { token, newPassword, confirmNewPassword } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'MISSING_TOKEN', message: 'Нууц үг сэргээх токен дутуу байна.' });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: 'Шинэ нууц үг хамгийн багадаа 8 тэмдэгт байх ёстой.'
+      });
+    }
+    if (confirmNewPassword !== undefined && newPassword !== confirmNewPassword) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: 'Шинэ нууц үгүүд хоорондоо таарахгүй байна.'
+      });
+    }
+
+    const result = await Storage.resetPasswordWithToken(token, newPassword);
+    if (!result.success) {
+      return res.status(400).json({
+        error: 'RESET_FAILED',
+        message: result.message
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: result.message
+    });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -457,7 +660,7 @@ app.post('/api/auth/update-profile', requireAuth, async (req: Request, res: Resp
       }
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -490,7 +693,7 @@ app.post('/api/auth/change-password', requireAuth, async (req: Request, res: Res
       message: 'Нууц үг амжилттай шинэчлэгдлээ.'
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -501,8 +704,7 @@ app.post('/api/auth/logout', (_req: Request, res: Response) => {
   return res.json({ success: true, message: 'Амжилттай гарлаа.' });
 });
 
-// Quick switch is intentionally unavailable in production. Development-only
-// switching still verifies that the target record exists in the database.
+// Quick switch is intentionally unavailable in production.
 app.post('/api/auth/switch-user', (req: Request, res: Response) => {
   if (isProduction) {
     return res.status(404).json({ error: 'NOT_FOUND', message: 'Энэ endpoint production орчинд идэвхгүй.' });
@@ -512,16 +714,41 @@ app.post('/api/auth/switch-user', (req: Request, res: Response) => {
     return res.status(400).json({ error: 'User ID is required' });
   }
 
-  void Storage.getUserById(String(userId)).then((targetUser) => {
-    if (!targetUser) {
-      return res.status(404).json({ error: 'USER_NOT_FOUND', message: 'Хэрэглэгч олдсонгүй.' });
-    }
-    setSessionCookie(res, targetUser.id!, 30 * 24 * 60 * 60);
-    return res.json({ success: true, userId: targetUser.id });
-  }).catch((error) => {
-    console.error('[Auth/SwitchUser] Error:', error);
-    return res.status(500).json({ error: 'SERVER_ERROR', message: 'Хэрэглэгч солиход алдаа гарлаа.' });
-  });
+  void Storage.getUserById(String(userId))
+    .then((targetUser) => {
+      if (!targetUser) {
+        return res.status(404).json({ error: 'USER_NOT_FOUND', message: 'Хэрэглэгч олдсонгүй.' });
+      }
+      setSessionCookie(res, targetUser.id!, 30 * 24 * 60 * 60);
+      return res.json({ success: true, userId: targetUser.id });
+    })
+    .catch((error) => {
+      console.error('[Auth/SwitchUser] Error:', error);
+      return res.status(500).json({ error: 'SERVER_ERROR', message: 'Хэрэглэгч солиход алдаа гарлаа.' });
+    });
+});
+
+// =============================================================
+// PUBLIC WEBSITE SETTINGS ENDPOINT (Phase 7)
+// =============================================================
+app.get('/api/settings', async (_req: Request, res: Response) => {
+  try {
+    const settings = await Storage.getWebsiteSettings();
+    res.json({ success: true, settings });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
+});
+
+app.get('/api/categories', async (_req: Request, res: Response) => {
+  try {
+    const categories = await Storage.getAllCategories();
+    res.json({ success: true, categories });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
 });
 
 // =============================================================
@@ -535,7 +762,7 @@ app.get('/api/admin/stats', requireAdmin, async (_req: Request, res: Response) =
     res.json({ success: true, stats });
   } catch (err: any) {
     console.error('[Admin/Stats] Error:', err);
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -547,15 +774,21 @@ app.get('/api/admin/movies', requireAdmin, async (req: Request, res: Response) =
     const movies = await Storage.getAllMovies({ search, genre, publishedOnly: false });
     res.json({ success: true, movies });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
-// 3. Movie Management: Create
+// 3. Movie Management: Create (Phase 1)
 app.post('/api/admin/movies', requireAdmin, async (req: Request, res: Response) => {
   try {
     const admin = (req as any).user as AuthenticatedUser;
-    const parseResult = movieSchema.safeParse(req.body);
+    const body = {
+      ...req.body,
+      synopsisMn: req.body?.synopsisMn ?? req.body?.descriptionMn ?? req.body?.synopsis?.mn ?? '',
+      synopsisEn: req.body?.synopsisEn ?? req.body?.descriptionEn ?? req.body?.synopsis?.en ?? ''
+    };
+
+    const parseResult = movieSchema.safeParse(body);
     if (!parseResult.success) {
       return res.status(400).json({
         error: 'VALIDATION_ERROR',
@@ -575,16 +808,68 @@ app.post('/api/admin/movies', requireAdmin, async (req: Request, res: Response) 
     res.status(201).json({ success: true, movie, message: 'Кино амжилттай нэмэгдлээ.' });
   } catch (err: any) {
     console.error('[Admin/CreateMovie] Error:', err);
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    const status = err?.code === 'DUPLICATE_SLUG' ? 409 : err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
-// 4. Movie Management: Update
+// 4. Movie Management: Update (Phase 1)
 app.put('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
     const admin = (req as any).user as AuthenticatedUser;
     const { id } = req.params;
-    const movie = await Storage.updateMovie(id, req.body);
+    const existing = await Storage.getMovieById(id);
+    if (!existing) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
+    }
+
+    const candidate = {
+      titleMn: req.body?.titleMn ?? req.body?.title?.mn ?? existing.titleMn ?? existing.title.mn,
+      titleEn: req.body?.titleEn ?? req.body?.title?.en ?? existing.titleEn ?? existing.title.en,
+      slug: req.body?.slug ?? existing.slug ?? existing.id,
+      synopsisMn:
+        req.body?.synopsisMn ??
+        req.body?.descriptionMn ??
+        req.body?.synopsis?.mn ??
+        existing.synopsisMn ??
+        existing.synopsis.mn,
+      synopsisEn:
+        req.body?.synopsisEn ??
+        req.body?.descriptionEn ??
+        req.body?.synopsis?.en ??
+        existing.synopsisEn ??
+        existing.synopsis.en,
+      posterUrl: req.body?.posterUrl ?? existing.posterUrl,
+      backdropUrl: req.body?.backdropUrl ?? req.body?.bannerUrl ?? existing.backdropUrl,
+      videoUrl: req.body?.videoUrl ?? req.body?.videoSource ?? existing.videoUrl,
+      trailerUrl: req.body?.trailerUrl ?? existing.trailerUrl ?? '',
+      year: req.body?.year ?? existing.year,
+      duration: req.body?.duration ?? existing.duration,
+      genres: req.body?.genres ?? existing.genres,
+      rating: req.body?.rating ?? existing.rating,
+      ageRating: req.body?.ageRating ?? existing.ageRating ?? '13+',
+      quality: req.body?.quality ?? existing.quality ?? '1080p Full HD',
+      directorMn: req.body?.directorMn ?? req.body?.director?.mn ?? existing.directorMn ?? '',
+      directorEn: req.body?.directorEn ?? req.body?.director?.en ?? existing.directorEn ?? '',
+      castMn: req.body?.castMn ?? req.body?.cast?.mn ?? existing.castMn ?? '',
+      castEn: req.body?.castEn ?? req.body?.cast?.en ?? existing.castEn ?? '',
+      language: req.body?.language ?? existing.language ?? 'mn',
+      type: req.body?.type ?? existing.type ?? 'movie',
+      featured: req.body?.featured !== undefined ? Boolean(req.body.featured) : existing.featured,
+      isPremium: req.body?.isPremium !== undefined ? Boolean(req.body.isPremium) : existing.isPremium,
+      minPlan: req.body?.minPlan ?? existing.minPlan ?? 'basic',
+      published: req.body?.published !== undefined ? Boolean(req.body.published) : existing.published
+    };
+
+    const parseResult = movieSchema.safeParse(candidate);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'VALIDATION_ERROR',
+        message: parseResult.error.issues[0]?.message || 'Киноны мэдээллээ зөв оруулна уу.'
+      });
+    }
+
+    const movie = await Storage.updateMovie(id, parseResult.data as any);
     if (!movie) {
       return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
     }
@@ -599,7 +884,8 @@ app.put('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Respons
 
     res.json({ success: true, movie, message: 'Киноны мэдээлэл амжилттай шинэчлэгдлээ.' });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    const status = err?.code === 'DUPLICATE_SLUG' ? 409 : err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -624,7 +910,7 @@ app.delete('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Resp
 
     res.json({ success: true, message: 'Кино амжилттай устгагдлаа.' });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -634,7 +920,7 @@ app.patch('/api/admin/movies/:id/toggle-publish', requireAdmin, async (req: Requ
     const admin = (req as any).user as AuthenticatedUser;
     const { id } = req.params;
     const movie = await Storage.getMovieById(id);
-    if (!movie) return res.status(404).json({ error: 'MOVIE_NOT_FOUND' });
+    if (!movie) return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
 
     const updated = await Storage.updateMovie(id, { published: !movie.published });
     await Storage.recordAuditLog({
@@ -644,9 +930,13 @@ app.patch('/api/admin/movies/:id/toggle-publish', requireAdmin, async (req: Requ
       target: id
     });
 
-    res.json({ success: true, movie: updated });
+    res.json({
+      success: true,
+      movie: updated,
+      message: updated?.published ? 'Кино нийтлэгдлээ.' : 'Кино ноорог төлөвт шилжлээ.'
+    });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -656,7 +946,7 @@ app.patch('/api/admin/movies/:id/toggle-featured', requireAdmin, async (req: Req
     const admin = (req as any).user as AuthenticatedUser;
     const { id } = req.params;
     const movie = await Storage.getMovieById(id);
-    if (!movie) return res.status(404).json({ error: 'MOVIE_NOT_FOUND' });
+    if (!movie) return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
 
     const updated = await Storage.updateMovie(id, { featured: !movie.featured });
     await Storage.recordAuditLog({
@@ -666,9 +956,13 @@ app.patch('/api/admin/movies/:id/toggle-featured', requireAdmin, async (req: Req
       target: id
     });
 
-    res.json({ success: true, movie: updated });
+    res.json({
+      success: true,
+      movie: updated,
+      message: updated?.featured ? 'Онцлох киногоор сонгогдлоо.' : 'Онцлох төлөв цуцлагдлаа.'
+    });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -678,7 +972,7 @@ app.get('/api/admin/categories', requireAdmin, async (_req: Request, res: Respon
     const categories = await Storage.getAllCategories();
     res.json({ success: true, categories });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -705,7 +999,7 @@ app.post('/api/admin/categories', requireAdmin, async (req: Request, res: Respon
 
     res.status(201).json({ success: true, category: cat, message: 'Ангилал амжилттай үүслээ.' });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -715,7 +1009,7 @@ app.put('/api/admin/categories/:id', requireAdmin, async (req: Request, res: Res
     const admin = (req as any).user as AuthenticatedUser;
     const { id } = req.params;
     const cat = await Storage.updateCategory(id, req.body);
-    if (!cat) return res.status(404).json({ error: 'CATEGORY_NOT_FOUND' });
+    if (!cat) return res.status(404).json({ error: 'CATEGORY_NOT_FOUND', message: 'Ангилал олдсонгүй.' });
 
     await Storage.recordAuditLog({
       adminId: admin.id,
@@ -727,7 +1021,7 @@ app.put('/api/admin/categories/:id', requireAdmin, async (req: Request, res: Res
 
     res.json({ success: true, category: cat, message: 'Ангилал шинэчлэгдлээ.' });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -746,7 +1040,7 @@ app.delete('/api/admin/categories/:id', requireAdmin, async (req: Request, res: 
 
     res.json({ success: true, message: 'Ангилал устгагдлаа.' });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -779,7 +1073,7 @@ app.get('/api/admin/users', requireAdmin, async (_req: Request, res: Response) =
 
     res.json({ success: true, users: sanitized });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -803,7 +1097,17 @@ app.patch('/api/admin/users/:id/role', requireAdmin, async (req: Request, res: R
       details: `Changed role to: ${role} for user ${updated.email}`
     });
 
-    res.json({ success: true, user: updated, message: 'Хэрэглэгчийн эрх амжилттай өөрчлөгдлөө.' });
+    res.json({
+      success: true,
+      user: {
+        id: updated.id,
+        name: updated.name,
+        email: updated.email,
+        role: updated.role,
+        status: updated.status
+      },
+      message: 'Хэрэглэгчийн эрх амжилттай өөрчлөгдлөө.'
+    });
   } catch (err: any) {
     res.status(400).json({ error: 'ROLE_UPDATE_FAILED', message: err.message });
   }
@@ -829,13 +1133,23 @@ app.patch('/api/admin/users/:id/status', requireAdmin, async (req: Request, res:
       details: `Changed status to: ${status} for user ${updated.email}`
     });
 
-    res.json({ success: true, user: updated, message: 'Хэрэглэгчийн төлөв амжилттай шинэчлэгдлөө.' });
+    res.json({
+      success: true,
+      user: {
+        id: updated.id,
+        name: updated.name,
+        email: updated.email,
+        role: updated.role,
+        status: updated.status
+      },
+      message: 'Хэрэглэгчийн төлөв амжилттай шинэчлэгдлээ.'
+    });
   } catch (err: any) {
     res.status(400).json({ error: 'STATUS_UPDATE_FAILED', message: err.message });
   }
 });
 
-// 15. Payment Management: List All Payments
+// 15. Payment Management: List All Payments + Approve / Reject Bank Transfers (Phase 3)
 app.get('/api/admin/payments', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const payments = await Storage.getAllPayments();
@@ -855,7 +1169,56 @@ app.get('/api/admin/payments', requireAdmin, async (_req: Request, res: Response
 
     res.json({ success: true, payments: enriched });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// Approve a pending bank transfer payment (Admin only)
+app.post('/api/admin/payments/:id/approve', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+
+    const result = await Storage.approveBankTransferPayment({
+      idOrOrderNumber: id,
+      adminId: admin.id,
+      adminEmail: admin.email
+    });
+
+    res.json({
+      success: true,
+      payment: result.payment,
+      subscription: result.subscription,
+      message: `Захиалга (${result.payment.orderNumber}) амжилттай баталгаажиж, гишүүнчлэл идэвхжлээ.`
+    });
+  } catch (err: any) {
+    const status = err?.code === 'ORDER_NOT_FOUND' ? 404 : err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'APPROVE_FAILED', message: err.message });
+  }
+});
+
+// Reject a bank transfer payment (Admin only)
+app.post('/api/admin/payments/:id/reject', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const reason = req.body?.reason ? String(req.body.reason).trim() : undefined;
+
+    const payment = await Storage.rejectBankTransferPayment({
+      idOrOrderNumber: id,
+      adminId: admin.id,
+      adminEmail: admin.email,
+      reason
+    });
+
+    res.json({
+      success: true,
+      payment,
+      message: `Захиалга (${payment.orderNumber}) татгалзагдлаа.`
+    });
+  } catch (err: any) {
+    const status = err?.code === 'ORDER_NOT_FOUND' ? 404 : err?.statusCode || 500;
+    res.status(status).json({ error: err?.code || 'REJECT_FAILED', message: err.message });
   }
 });
 
@@ -883,7 +1246,7 @@ app.get('/api/admin/subscriptions', requireAdmin, async (_req: Request, res: Res
 
     res.json({ success: true, subscriptions: enriched });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -907,7 +1270,7 @@ app.post('/api/admin/subscriptions/adjust', requireAdmin, async (req: Request, r
 
     res.json({ success: true, subscription: sub, message: 'Гишүүнчлэлийг амжилттай тохирууллаа.' });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
@@ -917,44 +1280,139 @@ app.get('/api/admin/audit-logs', requireAdmin, async (_req: Request, res: Respon
     const logs = await Storage.getAuditLogs(100);
     res.json({ success: true, logs });
   } catch (err: any) {
-    res.status(500).json({ error: 'SERVER_ERROR', message: err.message });
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
 });
 
-// 19. Movie Image Upload: Accepts Base64 data and writes to /public/uploads/
+// 19. Website Settings Admin Read & Update (Phase 7)
+app.get('/api/admin/settings', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const settings = await Storage.getWebsiteSettings();
+    res.json({
+      success: true,
+      settings,
+      integrations: {
+        wireConfigured: defaultWireService.isConfigured(),
+        cloudinaryConfigured: isCloudinaryConfigured(),
+        emailConfigured: isEmailServiceConfigured()
+      }
+    });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
+});
+
+app.put('/api/admin/settings', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const updated = await Storage.updateWebsiteSettings(req.body || {});
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'UPDATE_WEBSITE_SETTINGS',
+      target: 'global',
+      details: `Updated website settings (${updated.siteName})`
+    });
+    res.json({
+      success: true,
+      settings: updated,
+      message: 'Сайтын тохиргоо амжилттай хадгалагдлаа.'
+    });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// 20. Vercel-Compatible Cloud Image Upload via Cloudinary (Phase 5)
+app.get('/api/admin/upload/config', requireAdmin, (_req: Request, res: Response) => {
+  return res.json({
+    configured: isCloudinaryConfigured(),
+    provider: 'cloudinary',
+    maxFileSizeMb: 5
+  });
+});
+
 app.post('/api/admin/upload', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const { dataUrl, filename = 'image.jpg' } = req.body;
+    const admin = (req as any).user as AuthenticatedUser;
+    const { dataUrl, folder = 'sodon_ai_movie' } = req.body || {};
+
     if (!dataUrl || typeof dataUrl !== 'string') {
       return res.status(400).json({ error: 'INVALID_IMAGE', message: 'Зургийн өгөгдөл дутуу байна.' });
     }
 
-    const matches = dataUrl.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
-    if (!matches || matches.length !== 3) {
-      return res.status(400).json({ error: 'INVALID_BASE64', message: 'Хүчингүй зургийн формат.' });
+    const matches = dataUrl.match(/^data:(image\/(jpeg|jpg|png|webp|gif));base64,(.+)$/i);
+    if (!matches || matches.length !== 4) {
+      return res.status(400).json({
+        error: 'INVALID_MIME_TYPE',
+        message: 'Зөвхөн JPG, PNG, WEBP, GIF форматын зураг оруулах боломжтой.'
+      });
     }
 
-    const buffer = Buffer.from(matches[2], 'base64');
+    const buffer = Buffer.from(matches[3], 'base64');
     if (buffer.length > 5 * 1024 * 1024) {
-      return res.status(400).json({ error: 'FILE_TOO_LARGE', message: 'Зургийн хэмжээ 5MB-аас хэтрэхгүй байх ёстой.' });
+      return res.status(400).json({
+        error: 'FILE_TOO_LARGE',
+        message: 'Зургийн хэмжээ 5MB-аас хэтрэхгүй байх ёстой.'
+      });
     }
 
-    const uploadsDir = path.join(__dirname, 'public', 'uploads');
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
+    if (!isCloudinaryConfigured()) {
+      return res.status(503).json({
+        error: 'CLOUDINARY_NOT_CONFIGURED',
+        message:
+          'Клауд зургийн хадгалах сервис (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET) тохируулаагүй байна. Та зургийн URL холбоосыг шууд оруулна уу.'
+      });
     }
 
-    const ext = path.extname(filename) || '.jpg';
-    const safeName = `img_${Date.now()}_${crypto.randomBytes(3).toString('hex')}${ext}`;
-    const filePath = path.join(uploadsDir, safeName);
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME!.trim();
+    const apiKey = process.env.CLOUDINARY_API_KEY!.trim();
+    const apiSecret = process.env.CLOUDINARY_API_SECRET!.trim();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const safeFolder = String(folder).replace(/[^a-zA-Z0-9_-]/g, '') || 'sodon_ai_movie';
 
-    fs.writeFileSync(filePath, buffer);
-    const publicUrl = `/uploads/${safeName}`;
+    const paramsToSign = `folder=${safeFolder}&timestamp=${timestamp}${apiSecret}`;
+    const signature = crypto.createHash('sha1').update(paramsToSign).digest('hex');
 
-    res.json({ success: true, url: publicUrl, message: 'Зураг амжилттай хуулагдлаа.' });
+    const formPayload = new URLSearchParams();
+    formPayload.set('file', dataUrl);
+    formPayload.set('api_key', apiKey);
+    formPayload.set('timestamp', String(timestamp));
+    formPayload.set('folder', safeFolder);
+    formPayload.set('signature', signature);
+
+    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formPayload.toString()
+    });
+
+    const cloudData: any = await cloudRes.json();
+    if (!cloudRes.ok || !cloudData.secure_url) {
+      console.error('[Admin/Upload] Cloudinary error:', cloudData);
+      return res.status(502).json({
+        error: 'CLOUD_UPLOAD_FAILED',
+        message: cloudData?.error?.message || 'Клауд руу зураг хуулахад алдаа гарлаа.'
+      });
+    }
+
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'UPLOAD_IMAGE',
+      target: cloudData.public_id || cloudData.secure_url,
+      details: `Uploaded image (${Math.round(buffer.length / 1024)} KB) to Cloudinary`
+    });
+
+    return res.json({
+      success: true,
+      url: cloudData.secure_url,
+      publicId: cloudData.public_id,
+      message: 'Зураг клауд серверт амжилттай хуулагдлаа.'
+    });
   } catch (err: any) {
     console.error('[Admin/Upload] Error:', err);
-    res.status(500).json({ error: 'UPLOAD_FAILED', message: err.message });
+    return res.status(500).json({ error: 'UPLOAD_FAILED', message: err.message });
   }
 });
 
@@ -967,43 +1425,47 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // 3. Subscription Info
 // -------------------------------------------------------------
 app.get('/api/subscription', async (req: Request, res: Response) => {
-  const user = await getAuthenticatedUser(req);
-  if (!user) {
-    return res.json({ active: false, subscription: null });
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.json({ active: false, subscription: null });
+    }
+
+    const subscription = await Storage.getActiveSubscription(user.id);
+    const plan = subscription ? getPlanById(subscription.planId) : null;
+
+    let daysRemaining = 0;
+    if (subscription) {
+      const diff = new Date(subscription.endDate).getTime() - Date.now();
+      daysRemaining = Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
+    }
+
+    res.json({
+      active: Boolean(subscription),
+      subscription: subscription
+        ? {
+            id: subscription.id,
+            planId: subscription.planId,
+            planName: plan?.nameMn || subscription.planId,
+            status: subscription.status,
+            startDate: subscription.startDate,
+            endDate: subscription.endDate,
+            daysRemaining,
+            paymentId: subscription.paymentId,
+            features: plan?.featuresMn || []
+          }
+        : null
+    });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
-
-  const subscription = await Storage.getActiveSubscription(user.id);
-  const plan = subscription ? getPlanById(subscription.planId) : null;
-
-  let daysRemaining = 0;
-  if (subscription) {
-    const diff = subscription.endDate.getTime() - Date.now();
-    daysRemaining = Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
-  }
-
-  res.json({
-    active: Boolean(subscription),
-    subscription: subscription
-      ? {
-          id: subscription.id,
-          planId: subscription.planId,
-          planName: plan?.nameMn || subscription.planId,
-          status: subscription.status,
-          startDate: subscription.startDate,
-          endDate: subscription.endDate,
-          daysRemaining,
-          paymentId: subscription.paymentId,
-          features: plan?.featuresMn || []
-        }
-      : null
-  });
 });
 
 // -------------------------------------------------------------
 // Bank Transfer Details API
 // GET /api/bank-details
 // -------------------------------------------------------------
-app.get('/api/bank-details', (req: Request, res: Response) => {
+app.get('/api/bank-details', (_req: Request, res: Response) => {
   res.json({ bankDetails: BANK_TRANSFER_DETAILS });
 });
 
@@ -1030,12 +1492,12 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
     }
 
     const plan = SUBSCRIPTION_PLANS[planId];
-    // Rule: Amount must come strictly from server-side subscription configuration.
-    // Never trust client prices!
-    const serverAmount = plan.price;
+    const settings = await Storage.getWebsiteSettings();
+    const configuredPrice = settings?.subscriptionPrices?.[planId as 'basic' | 'standard' | 'premium'];
+    // Rule: Amount must come strictly from server-side configuration. Never trust client prices!
+    const serverAmount = typeof configuredPrice === 'number' && configuredPrice > 0 ? configuredPrice : plan.price;
     const currency = 'MNT';
 
-    // Unique order number
     const orderNumber = `AIMOV-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
     const idempotencyKey = `order_${orderNumber}_pi`;
 
@@ -1049,7 +1511,6 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
 
     // Only invoke Wire API for wire_qpay payments
     if (paymentMethod === 'wire_qpay' && defaultWireService.isConfigured()) {
-      // 1. Create PaymentIntent on Wire API
       const paymentIntent = await defaultWireService.createPaymentIntent({
         amount: serverAmount,
         currency: 'MNT',
@@ -1064,7 +1525,6 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
 
       wirePaymentIntentId = paymentIntent.id;
 
-      // 2. Create Hosted Checkout Session on Wire API
       const checkoutSession = await defaultWireService.createCheckoutSession({
         payment_intent: paymentIntent.id,
         success_url: successUrl,
@@ -1078,7 +1538,6 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
       wirePaymentIntentId = `bank_transfer_${orderNumber}`;
     }
 
-    // Record internal pending payment
     const payment = await Storage.createPayment({
       userId: user.id,
       orderNumber,
@@ -1105,21 +1564,23 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
       plan: {
         id: plan.id,
         nameMn: plan.nameMn,
-        price: plan.price
+        price: serverAmount
       }
     });
   } catch (error: any) {
     console.error('[Payments/Create] Error:', error);
-    res.status(500).json({
-      error: 'PAYMENT_CREATION_FAILED',
+    res.status(error?.statusCode || 500).json({
+      error: error?.code || 'PAYMENT_CREATION_FAILED',
       message: error?.message || 'Төлбөрийн захиалга үүсгэхэд алдаа гарлаа.'
     });
   }
 });
 
 // -------------------------------------------------------------
-// Bank Transfer Confirmation
+// Bank Transfer Submission (Phase 3 Security Fix)
 // POST /api/payments/bank-transfer/confirm
+// Users CANNOT self-approve bank transfers to PAID or activate subscriptions!
+// Sets status to PENDING_REVIEW until verified by an Administrator.
 // -------------------------------------------------------------
 app.post('/api/payments/bank-transfer/confirm', async (req: Request, res: Response) => {
   try {
@@ -1127,10 +1588,10 @@ app.post('/api/payments/bank-transfer/confirm', async (req: Request, res: Respon
     if (!user) {
       return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Нэвтэрч орно уу.' });
     }
-    const { orderNumber, senderName, transferRef, phone } = req.body;
+    const { orderNumber, senderName, transferRef, phone } = req.body || {};
 
     if (!orderNumber) {
-      return res.status(400).json({ error: 'orderNumber is required' });
+      return res.status(400).json({ error: 'MISSING_ORDER_NUMBER', message: 'orderNumber шаардлагатай.' });
     }
 
     const payment = await Storage.getPaymentByOrderNumber(orderNumber);
@@ -1139,43 +1600,49 @@ app.post('/api/payments/bank-transfer/confirm', async (req: Request, res: Respon
     }
 
     if (payment.userId !== user.id) {
-      return res.status(403).json({ error: 'UNAUTHORIZED_ACCESS' });
+      return res.status(403).json({ error: 'UNAUTHORIZED_ACCESS', message: 'Энэ захиалгад хандах эрхгүй байна.' });
     }
 
     if (payment.status === 'PAID') {
-      return res.json({ success: true, message: 'Захиалга аль хэдийн баталгаажсан байна.', orderNumber });
+      return res.json({
+        success: true,
+        status: 'PAID',
+        message: 'Захиалга аль хэдийн баталгаажсан байна.',
+        orderNumber
+      });
     }
 
-    const refString = transferRef || `TXN-${Date.now().toString().slice(-6)}`;
-    const sender = senderName ? `${senderName}${phone ? ` (${phone})` : ''}` : user.name;
+    const refString = transferRef ? String(transferRef).trim() : `TXN-${Date.now().toString().slice(-6)}`;
+    const sender = senderName
+      ? `${String(senderName).trim()}${phone ? ` (${String(phone).trim()})` : ''}`
+      : user.name;
 
-    // Update payment record to PAID
-    await Storage.updatePaymentStatus(payment.orderNumber, 'PAID', {
-      paidAt: new Date(),
+    // Security rule: Bank transfer submission places order into PENDING_REVIEW.
+    // It MUST NOT mark payment PAID or activate subscription until admin approval!
+    const updated = await Storage.updatePaymentStatus(payment.orderNumber, 'PENDING_REVIEW', {
       bankSenderName: sender,
-      bankTransferRef: refString
+      bankTransferRef: refString,
+      previousStatus: payment.status
     });
 
-    // Activate subscription in database
-    await Storage.activateSubscription({
-      userId: payment.userId,
-      planId: payment.planId,
-      paymentId: payment.orderNumber,
-      durationDays: 30
-    });
-
-    console.log(`[BankTransfer] Order ${payment.orderNumber} confirmed for user ${payment.userId}. Plan ${payment.planId} activated.`);
+    console.log(
+      `[BankTransfer] Order ${payment.orderNumber} submitted by user ${payment.userId} for admin review (status=PENDING_REVIEW).`
+    );
 
     res.json({
       success: true,
-      message: 'Дансны шилжүүлэг амжилттай баталгаажиж, гишүүнчлэл идэвхжлээ.',
+      message:
+        'Дансны шилжүүлгийн мэдээлэл хүлээн авагдлаа. Администратор гүйлгээг шалгасны дараа таны гишүүнчлэл идэвхжинэ.',
       orderNumber: payment.orderNumber,
       planId: payment.planId,
-      status: 'PAID'
+      status: updated?.status || 'PENDING_REVIEW'
     });
   } catch (error: any) {
     console.error('[BankTransfer/Confirm] Error:', error);
-    res.status(500).json({ error: 'SERVER_ERROR', message: error?.message || 'Баталгаажуулахад алдаа гарлаа.' });
+    res.status(error?.statusCode || 500).json({
+      error: error?.code || 'SERVER_ERROR',
+      message: error?.message || 'Баталгаажуулахад алдаа гарлаа.'
+    });
   }
 });
 
@@ -1184,31 +1651,38 @@ app.post('/api/payments/bank-transfer/confirm', async (req: Request, res: Respon
 // GET /api/payments/history
 // -------------------------------------------------------------
 app.get('/api/payments/history', async (req: Request, res: Response) => {
-  const user = await getAuthenticatedUser(req);
-  if (!user) {
-    return res.json({ payments: [] });
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.json({ payments: [] });
+    }
+    const payments = await Storage.getPaymentsByUserId(user.id);
+
+    const formatted = payments.map((p) => {
+      const plan = getPlanById(p.planId);
+      return {
+        id: p.id,
+        orderNumber: p.orderNumber,
+        planId: p.planId,
+        planName: plan?.nameMn || p.planId,
+        paymentMethod: p.paymentMethod || 'wire_qpay',
+        amount: p.amount,
+        currency: p.currency,
+        status: p.status,
+        wirePaymentIntentId: p.wirePaymentIntentId,
+        bankSenderName: p.bankSenderName,
+        bankTransferRef: p.bankTransferRef,
+        rejectionReason: p.rejectionReason,
+        createdAt: p.createdAt,
+        paidAt: p.paidAt,
+        verifiedAt: p.verifiedAt
+      };
+    });
+
+    res.json({ payments: formatted });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
-  const payments = await Storage.getPaymentsByUserId(user.id);
-
-  const formatted = payments.map((p) => {
-    const plan = getPlanById(p.planId);
-    return {
-      orderNumber: p.orderNumber,
-      planId: p.planId,
-      planName: plan?.nameMn || p.planId,
-      paymentMethod: p.paymentMethod || 'wire_qpay',
-      amount: p.amount,
-      currency: p.currency,
-      status: p.status,
-      wirePaymentIntentId: p.wirePaymentIntentId,
-      bankSenderName: p.bankSenderName,
-      bankTransferRef: p.bankTransferRef,
-      createdAt: p.createdAt,
-      paidAt: p.paidAt
-    };
-  });
-
-  res.json({ payments: formatted });
 });
 
 // -------------------------------------------------------------
@@ -1228,15 +1702,15 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
       });
     }
 
-    // Verify ownership if user is logged in
-    if (user && payment.userId && payment.userId !== user.id) {
+    // Verify ownership if user is logged in (admins can also inspect)
+    if (user && user.role !== 'admin' && payment.userId && payment.userId !== user.id) {
       return res.status(403).json({
         error: 'UNAUTHORIZED_ORDER_ACCESS',
         message: 'Энэ захиалгын мэдээлэлд хандах эрхгүй байна.'
       });
     }
 
-    // If PENDING and Wire is configured, we can independently query Wire to check for updates (only for wire_qpay)
+    // If PENDING and Wire is configured, query Wire to check for updates (only for wire_qpay)
     if (
       payment.status === 'PENDING' &&
       payment.paymentMethod === 'wire_qpay' &&
@@ -1247,7 +1721,6 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
       try {
         const wirePi = await defaultWireService.getPaymentIntent(payment.wirePaymentIntentId);
         if (wirePi.status === 'succeeded') {
-          // Double verify amount and currency
           if (wirePi.amount === payment.amount && wirePi.currency === 'MNT') {
             await Storage.updatePaymentStatus(payment.orderNumber, 'PAID', {
               paidAt: new Date(),
@@ -1274,6 +1747,7 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
     const plan = getPlanById(payment.planId);
 
     res.json({
+      id: payment.id,
       orderNumber: payment.orderNumber,
       status: payment.status,
       paymentMethod: payment.paymentMethod || 'wire_qpay',
@@ -1284,14 +1758,16 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
       checkoutUrl: payment.checkoutUrl,
       bankSenderName: payment.bankSenderName,
       bankTransferRef: payment.bankTransferRef,
+      rejectionReason: payment.rejectionReason,
       bankTransferDetails: BANK_TRANSFER_DETAILS,
       createdAt: payment.createdAt,
-      paidAt: payment.paidAt
+      paidAt: payment.paidAt,
+      verifiedAt: payment.verifiedAt
     });
   } catch (error: any) {
     console.error('[Payments/Get] Error:', error);
-    res.status(500).json({
-      error: 'SERVER_ERROR',
+    res.status(error?.statusCode || 500).json({
+      error: error?.code || 'SERVER_ERROR',
       message: 'Захиалгын мэдээлэл авахад алдаа гарлаа.'
     });
   }
@@ -1357,7 +1833,6 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'MISSING_PAYMENT_INTENT_ID' });
     }
 
-    // Step 1: Match the Wire PaymentIntent ID with the internal payment order
     const order = await Storage.getPaymentByIntentId(paymentIntentId);
     if (!order) {
       console.warn(`[Webhook/Wire] Order not found for PaymentIntent ${paymentIntentId}`);
@@ -1371,7 +1846,6 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
       return res.status(200).json({ received: true, warning: 'Order not found' });
     }
 
-    // Step 2: Check if order has already been fulfilled
     if (order.status === 'PAID') {
       console.log(`[Webhook/Wire] Order ${order.orderNumber} already fulfilled.`);
       await Storage.recordWebhookEvent({
@@ -1383,7 +1857,6 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
       return res.status(200).json({ received: true, note: 'Already fulfilled' });
     }
 
-    // Step 3: Retrieve the PaymentIntent from Wire API to independently verify its status
     let verifiedIntent: any = paymentIntentData;
     if (defaultWireService.isConfigured()) {
       try {
@@ -1394,13 +1867,11 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
       }
     }
 
-    // Step 4: Verify status is succeeded
     if (verifiedIntent.status !== 'succeeded') {
       console.warn(`[Webhook/Wire] Verified intent status is '${verifiedIntent.status}', not 'succeeded'`);
       return res.status(400).json({ error: 'INTENT_NOT_SUCCEEDED' });
     }
 
-    // Step 5: Verify amount matches internal order
     if (verifiedIntent.amount !== order.amount) {
       console.error(
         `[Webhook/Wire] Amount mismatch! Expected ${order.amount} MNT, got ${verifiedIntent.amount} MNT`
@@ -1408,20 +1879,17 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'AMOUNT_MISMATCH' });
     }
 
-    // Step 6: Verify currency is MNT
     if (verifiedIntent.currency !== 'MNT') {
       console.error(`[Webhook/Wire] Currency mismatch! Expected MNT, got ${verifiedIntent.currency}`);
       return res.status(400).json({ error: 'CURRENCY_MISMATCH' });
     }
 
-    // Step 7: Update order to PAID and record charge id
     const chargeId = verifiedIntent.charges?.data?.[0]?.id;
     await Storage.updatePaymentStatus(order.orderNumber, 'PAID', {
       paidAt: new Date(),
       wireChargeId: chargeId
     });
 
-    // Step 8: Activate subscription in database exactly once
     await Storage.activateSubscription({
       userId: order.userId,
       planId: order.planId,
@@ -1429,7 +1897,6 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
       durationDays: 30
     });
 
-    // Step 9 & 10: Store completion time and record event ID
     await Storage.recordWebhookEvent({
       eventId,
       eventType,
@@ -1443,7 +1910,6 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
     return res.status(200).json({ success: true, orderNumber: order.orderNumber, planId: order.planId });
   }
 
-  // Other Wire webhook events (record and ack)
   await Storage.recordWebhookEvent({
     eventId,
     eventType,
@@ -1455,85 +1921,115 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 8. Movies & Protected Streaming
+// 8. Movies & Protected Streaming (Phase 2 & Phase 4)
 // -------------------------------------------------------------
-app.get('/api/movies', async (_req: Request, res: Response) => {
+app.get('/api/movies', async (req: Request, res: Response) => {
   try {
-    const list = await Storage.getAllMovies({ publishedOnly: true });
+    const search = req.query.search ? String(req.query.search) : undefined;
+    const genre = req.query.genre ? String(req.query.genre) : undefined;
+    const featuredOnly = req.query.featured === 'true';
+
+    const list = await Storage.getAllMovies({
+      publishedOnly: true,
+      featuredOnly,
+      search,
+      genre
+    });
+
     const publicList = list.map((m) => {
       const { videoSource, videoUrl, ...rest } = m as any;
       return rest;
     });
+
     res.json({ movies: publicList });
   } catch (err: any) {
-    const fallbackList = MOVIES.map((m) => {
-      const { videoSource, ...rest } = m;
-      return rest;
+    console.error('[API/Movies] Error:', err);
+    const status = err?.statusCode || 500;
+    res.status(status).json({
+      error: err?.code || 'MOVIES_FETCH_FAILED',
+      message: err.message || 'Киноны жагсаалт ачаалахад алдаа гарлаа.'
     });
-    res.json({ movies: fallbackList });
   }
 });
 
-// Stream endpoint with server-side subscription check
+app.get('/api/movies/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    const user = await getAuthenticatedUser(req);
+
+    if (!movie || (!movie.published && user?.role !== 'admin')) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
+    }
+
+    const { videoSource, videoUrl, ...publicMovie } = movie as any;
+    return res.json({ movie: publicMovie });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+  }
+});
+
+// Stream endpoint with centralized server-side subscription & plan tier hierarchy check (Phase 4)
 app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
-  const { id } = req.params;
-  let movie = await Storage.getMovieById(id);
-  if (!movie) {
-    const legacy = getMovieById(id);
-    if (legacy) {
-      movie = legacy as any;
+  try {
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+
+    if (!movie || !movie.published) {
+      const userCheck = await getAuthenticatedUser(req);
+      if (!movie || (userCheck?.role !== 'admin' && !movie.published)) {
+        return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
+      }
     }
-  }
 
-  if (!movie) {
-    return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
-  }
+    const user = await getAuthenticatedUser(req);
+    const activeSub = user ? await Storage.getActiveSubscription(user.id) : null;
 
-  // Increment views count asynchronously
-  Storage.incrementMovieViews(id).catch(() => {});
+    const access = checkMovieAccess({
+      movie,
+      user,
+      subscription: activeSub
+    });
 
-  const user = await getAuthenticatedUser(req);
-
-  // If movie is premium, enforce active subscription check
-  if (movie.isPremium) {
-    if (!user) {
-      return res.status(401).json({
-        error: 'AUTH_REQUIRED',
-        message: 'Энэ киног үзэхийн тулд эхлээд системд нэвтэрнэ үү.'
+    if (!access.allowed) {
+      const statusCode = access.code === 'AUTH_REQUIRED' ? 401 : 403;
+      return res.status(statusCode).json({
+        error: access.code || 'PREMIUM_REQUIRED',
+        message: access.messageMn || 'Энэ киног үзэхийн тулд идэвхтэй гишүүнчлэл шаардлагатай.',
+        messageEn: access.messageEn,
+        requiresPlan: access.requiredPlan || movie.minPlan,
+        currentPlan: access.currentPlan || null
       });
     }
-    const activeSub = await Storage.getActiveSubscription(user.id);
-    if (!activeSub) {
-      return res.status(403).json({
-        error: 'PREMIUM_REQUIRED',
-        message: 'Энэ киног үзэхийн тулд идэвхтэй гишүүнчлэл шаардлагатай.',
-        requiresPlan: movie.minPlan
-      });
-    }
+
+    // Increment views count asynchronously
+    Storage.incrementMovieViews(movie.id).catch(() => {});
+
+    // Create signed token with 2 hour expiration
+    const userId = user ? user.id : 'guest';
+    const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
+    const tokenSecret = getAuthSecret();
+    const tokenPayload = `${movie.id}:${userId}:${expiresAt}`;
+    const signedToken = crypto.createHmac('sha256', tokenSecret).update(tokenPayload).digest('hex');
+
+    res.json({
+      authorized: true,
+      movieId: movie.id,
+      titleMn: movie.titleMn || movie.title?.mn,
+      quality: movie.quality,
+      streamUrl: movie.videoUrl || movie.videoSource,
+      expiresAt,
+      token: signedToken
+    });
+  } catch (err: any) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
   }
-
-  // Create signed token with 2 hour expiration
-  const userId = user ? user.id : 'guest';
-  const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
-  const tokenSecret = getAuthSecret();
-  const tokenPayload = `${movie.id}:${userId}:${expiresAt}`;
-  const signedToken = crypto.createHmac('sha256', tokenSecret).update(tokenPayload).digest('hex');
-
-  res.json({
-    authorized: true,
-    movieId: movie.id,
-    titleMn: movie.titleMn || movie.title?.mn,
-    quality: movie.quality,
-    streamUrl: (movie as any).videoSource || (movie as any).videoUrl,
-    expiresAt,
-    token: signedToken
-  });
 });
 
 // -------------------------------------------------------------
-// 9. Integration Test Simulation Endpoint
-// Allows simulating a real Wire webhook with valid HMAC signature
-// for testing and validation
+// 9. Integration Test Simulation Endpoint (Disabled in Production)
 // -------------------------------------------------------------
 app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) => {
   if (isProduction) {
@@ -1590,7 +2086,6 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
     const signature = wireService.computeSignature(rawBody, now, testSecret);
     const signatureHeader = `t=${now},v1=${signature}`;
 
-    // Verify signature internally
     wireService.verifyWebhookSignature({
       rawBody,
       signatureHeader,
@@ -1598,7 +2093,6 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
       currentTimeSeconds: now
     });
 
-    // Execute state update
     await Storage.updatePaymentStatus(order.orderNumber, 'PAID', {
       paidAt: new Date(),
       wireChargeId: `ch_wire_${orderNumber}`
@@ -1631,8 +2125,7 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
   }
 });
 
-// API paths must always produce JSON, including unknown endpoints. Register
-// this only after every API route so valid routes are not shadowed.
+// API paths must always produce JSON, including unknown endpoints.
 app.use('/api', (_req: Request, res: Response) => {
   return res.status(404).json({
     error: 'API_ROUTE_NOT_FOUND',
@@ -1646,8 +2139,9 @@ app.use('/api', (_req: Request, res: Response) => {
 function injectSeoIntoHtml(htmlTemplate: string, req: Request): string {
   const url = req.originalUrl || req.url;
   const pathLocale = getLocaleFromPath(url);
-  const cookieLocale = req.headers.cookie?.match(/NEXT_LOCALE=([a-z]{2})/)?.[1] ||
-                       req.headers.cookie?.match(/ai_movie_locale=([a-z]{2})/)?.[1];
+  const cookieLocale =
+    req.headers.cookie?.match(/NEXT_LOCALE=([a-z]{2})/)?.[1] ||
+    req.headers.cookie?.match(/ai_movie_locale=([a-z]{2})/)?.[1];
   const detectedLocale = pathLocale || (cookieLocale === 'en' ? 'en' : 'mn');
 
   const baseUrl = getBaseUrl(req);
@@ -1655,19 +2149,12 @@ function injectSeoIntoHtml(htmlTemplate: string, req: Request): string {
 
   let html = htmlTemplate;
 
-  // Set html lang attribute
   html = html.replace(/<html(\s+[^>]*)?lang="[^"]*"/i, `<html$1lang="${detectedLocale}"`);
-
-  // Replace <title>
   html = html.replace(/<title>[\s\S]*?<\/title>/i, `<title>${metadata.title}</title>`);
-
-  // Replace <meta name="description" ...>
   html = html.replace(
     /<meta\s+name="description"\s+content="[^"]*"\s*\/?>/i,
     `<meta name="description" content="${metadata.description}" />`
   );
-
-  // Replace OpenGraph title & description
   html = html.replace(
     /<meta\s+property="og:title"\s+content="[^"]*"\s*\/?>/i,
     `<meta property="og:title" content="${metadata.ogTitle}" />`
@@ -1677,7 +2164,6 @@ function injectSeoIntoHtml(htmlTemplate: string, req: Request): string {
     `<meta property="og:description" content="${metadata.ogDescription}" />`
   );
 
-  // Inject or update canonical, twitter, and Schema.org structured data (JSON-LD)
   const dynamicSeoSnippet = `
     <!-- Crawl-time Localized SEO & Social Cards -->
     <link rel="canonical" href="${metadata.canonicalUrl}" />
@@ -1698,7 +2184,6 @@ function registerHtmlRoutes(vite: any = null) {
     app.use(express.static(distDir, { index: false }));
   }
 
-  // Catch-all JSON 404 for unknown /api/* endpoints
   app.all('/api/*', (_req: Request, res: Response) => {
     res.status(404).json({
       error: 'API_NOT_FOUND',
@@ -1706,10 +2191,8 @@ function registerHtmlRoutes(vite: any = null) {
     });
   });
 
-  // Handle all HTML/navigation routes with dynamic localized SEO metadata
   app.get('*', async (req: Request, res: Response, next: NextFunction) => {
     const url = req.originalUrl;
-    // Skip API routes or static files with extension
     if (url.startsWith('/api') || path.extname(url)) {
       return next();
     }
@@ -1757,8 +2240,6 @@ async function startServer() {
   });
 }
 
-// Vercel imports this Express application as a serverless API function.
-// Do not start a long-lived listener inside a serverless invocation.
 if (isProduction && process.env.VERCEL === '1') {
   registerHtmlRoutes();
 } else if (process.env.VERCEL !== '1') {
@@ -1768,5 +2249,4 @@ if (isProduction && process.env.VERCEL === '1') {
   });
 }
 
-// Keep the existing Express + MongoDB backend; no mock Auth.js/Next.js layer.
 export default app;

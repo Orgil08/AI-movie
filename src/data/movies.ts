@@ -7,19 +7,24 @@ export interface LocalizedField {
 
 export interface Movie {
   id: string; // unique slug
+  slug?: string;
   title?: string | LocalizedField;
   synopsis?: string | LocalizedField;
-  // Backward-compatible fields
+  // Backward-compatible & MongoDB fields
   titleMn: string;
   titleEn: string;
+  synopsisMn?: string;
+  synopsisEn?: string;
   descriptionMn: string;
   descriptionEn?: string;
   year: number;
   duration: string;
   genre?: string | LocalizedField;
+  genres?: string[];
   genreMn: string;
   genreEn?: string;
   rating: string;
+  ageRating?: string;
   quality: '4K HDR' | '1080p Full HD' | '720p HD';
   isPremium: boolean;
   minPlan: 'basic' | 'standard' | 'premium';
@@ -30,12 +35,16 @@ export interface Movie {
   castMn?: string;
   castEn?: string;
   bannerUrl: string;
+  backdropUrl?: string;
   posterUrl: string;
   trailerUrl: string;
   videoSource: string; // Internal protected video source
+  videoUrl?: string;
   tags: string[];
   featured?: boolean;
   trending?: boolean;
+  published?: boolean;
+  views?: number;
   top10?: number;
 }
 

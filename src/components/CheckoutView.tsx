@@ -130,10 +130,12 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
         throw new Error(data.message || 'Error confirming bank transfer');
       }
 
-      setTransferSuccessMsg(data.message || (locale === 'en' ? 'Payment confirmed!' : 'Төлбөр баталгаажлаа!'));
-      setTimeout(() => {
-        onPaymentConfirmed(orderNumber);
-      }, 1000);
+      setTransferSuccessMsg(
+        locale === 'en'
+          ? (data.messageEn || data.message || 'Transfer details submitted! Waiting for Admin verification.')
+          : (data.message || 'Шилжүүлгийн мэдээлэл илгээгдлээ. Админ шалгаж баталгаажуулсны дараа гишүүнчлэл идэвхжинэ.')
+      );
+      fetchOrder();
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -448,6 +450,42 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                 </div>
               </div>
 
+              {/* Pending Admin Review or Rejected Status Banner */}
+              {order.status === 'PENDING_REVIEW' && (
+                <div className="p-4 rounded-xl bg-amber-950/50 border border-amber-500/40 text-amber-200 text-xs space-y-1.5">
+                  <div className="font-bold flex items-center gap-2 text-[#e5a93c]">
+                    <Clock className="w-4 h-4 shrink-0" />
+                    <span>
+                      {locale === 'en'
+                        ? 'Pending Admin Verification (PENDING_REVIEW)'
+                        : 'Админ шалгаж байна (PENDING_REVIEW)'}
+                    </span>
+                  </div>
+                  <p className="text-amber-300/90 leading-relaxed">
+                    {locale === 'en'
+                      ? 'Your bank transfer details have been submitted. Your subscription will activate automatically as soon as an administrator verifies the Khan Bank settlement.'
+                      : 'Таны шилжүүлгийн мэдээлэл бүртгэгдсэн байна. Админ дансны гүйлгээг шалгаж баталгаажуурмагц таны гишүүнчлэл автоматаар идэвхжинэ.'}
+                  </p>
+                </div>
+              )}
+
+              {order.status === 'REJECTED' && (
+                <div className="p-4 rounded-xl bg-red-950/60 border border-red-500/40 text-red-200 text-xs space-y-1">
+                  <div className="font-bold flex items-center gap-2 text-red-400">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>
+                      {locale === 'en' ? 'Bank Transfer Rejected' : 'Шилжүүлэг татгалзагдсан'}
+                    </span>
+                  </div>
+                  <p className="text-red-300/90">
+                    {order.rejectionReason ||
+                      (locale === 'en'
+                        ? 'Your bank transfer could not be verified. Please check your reference and resubmit.'
+                        : 'Таны шилжүүлгийн мэдээлэл баталгаажсангүй. Гүйлгээний утга болон мэдээллээ шалгаад дахин илгээнэ үү.')}
+                  </p>
+                </div>
+              )}
+
               {/* Confirmation Form */}
               <form onSubmit={handleConfirmBankTransfer} className="p-5 rounded-xl bg-[#0b0f19] border border-white/10 space-y-4">
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">
@@ -456,8 +494,8 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                 </div>
                 <p className="text-[11px] text-slate-400 leading-relaxed">
                   {locale === 'en'
-                    ? 'After transferring the plan amount to the Khan Bank account above, enter your name and phone number to instantly activate your membership.'
-                    : 'Та дээрх Хаан банкны данс руу шилжүүлгээ хийсний дараа өөрийн мэдээллээ оруулан доорх товчийг дарж гишүүнчлэлээ идэвхжүүлнэ үү.'}
+                    ? 'After transferring the plan amount to the Khan Bank account above, submit your sender name, phone number, and transaction reference for admin verification.'
+                    : 'Та дээрх Хаан банкны данс руу шилжүүлгээ хийсний дараа өөрийн нэр, утасны дугаар болон гүйлгээний дугаараа оруулан шалгуулахаар илгээнэ үү. Админ баталгаажуулсны дараа гишүүнчлэл идэвхжинэ.'}
                 </p>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
@@ -465,6 +503,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                     <label className="block text-slate-400 mb-1">{t('senderName')}:</label>
                     <input
                       type="text"
+                      required
                       placeholder={locale === 'en' ? 'e.g. Batbayar' : 'Жишээ: Батбаяр'}
                       value={senderName}
                       onChange={(e) => setSenderName(e.target.value)}
@@ -475,6 +514,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                     <label className="block text-slate-400 mb-1">{t('senderPhone')}:</label>
                     <input
                       type="text"
+                      required
                       placeholder="e.g. 99112233"
                       value={phone}
                       onChange={(e) => setPhone(e.target.value)}
@@ -485,7 +525,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
 
                 <div>
                   <label className="block text-slate-400 mb-1 text-xs">
-                    {locale === 'en' ? 'Transaction reference (Optional):' : 'Гүйлгээний дугаар эсвэл баримт (Сонголттой):'}
+                    {locale === 'en' ? 'Transaction reference:' : 'Гүйлгээний дугаар эсвэл баримт:'}
                   </label>
                   <input
                     type="text"
@@ -509,14 +549,20 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
                   ) : (
                     <>
                       <CheckCircle2 className="w-4 h-4" />
-                      <span>{t('confirmTransfer')}</span>
+                      <span>
+                        {order.status === 'PENDING_REVIEW'
+                          ? locale === 'en'
+                            ? 'Update Submitted Transfer Details'
+                            : 'Шилжүүлгийн мэдээлэл шинэчлэх'
+                          : t('confirmTransfer')}
+                      </span>
                     </>
                   )}
                 </button>
 
                 {transferSuccessMsg && (
-                  <div className="p-3 rounded-lg bg-emerald-950/60 border border-emerald-800/60 text-emerald-300 text-xs flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <div className="p-3 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200 text-xs flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-[#e5a93c] shrink-0" />
                     <span>{transferSuccessMsg}</span>
                   </div>
                 )}
