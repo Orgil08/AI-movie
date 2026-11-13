@@ -13,11 +13,13 @@ export interface Movie {
   // Backward-compatible & MongoDB fields
   titleMn: string;
   titleEn: string;
+  originalTitle?: string;
   synopsisMn?: string;
   synopsisEn?: string;
   descriptionMn: string;
   descriptionEn?: string;
   year: number;
+  country?: string;
   duration: string;
   genre?: string | LocalizedField;
   genres?: string[];
@@ -41,11 +43,24 @@ export interface Movie {
   videoSource: string; // Internal protected video source
   videoUrl?: string;
   tags: string[];
+  type?: 'movie' | 'series';
   featured?: boolean;
   trending?: boolean;
   published?: boolean;
   views?: number;
+  viewsCount?: number;
   top10?: number;
+  // iKINO-style Series & Monetization fields
+  hasMongolianSubtitles?: boolean;
+  isOriginal?: boolean;
+  isExclusive?: boolean;
+  isShortDrama?: boolean;
+  totalEpisodes?: number;
+  freeEpisodes?: number;
+  unlockPrice?: number;
+  rentalDurationHours?: number;
+  vipEnabled?: boolean;
+  seriesStatus?: 'ongoing' | 'completed' | 'draft';
 }
 
 /**
@@ -77,6 +92,72 @@ export function getLocalizedMovieText(
 }
 
 export const MOVIES: Movie[] = [
+  {
+    id: 'sorrow-pact-series',
+    slug: 'sorrow-pact-series',
+    title: {
+      mn: 'Уй гашуу дарагдсан гэрээ',
+      en: 'A Lifetime Pact Buried In Sorrow'
+    },
+    synopsis: {
+      mn: 'Гүнж Серафина хунтайж Каэлд дурласан боловч хунтайж түүний эгчид итгэн охиныг гомдоож зовооно. Бүсгүй асар их уй гашуу дунд өөрийн хайрыг золиослон байж ордны хууран мэхлэлтийг илчлэхээр шийднэ.',
+      en: 'Princess Seraphina fell in love with Prince Kael, only to be betrayed and tormented when he believed her sister’s deceit. Amidst overwhelming sorrow, she sacrifices her love to expose the palace conspiracy.'
+    },
+    titleMn: 'Уй гашуу дарагдсан гэрээ',
+    titleEn: 'A Lifetime Pact Buried In Sorrow',
+    originalTitle: 'A Lifetime Pact Buried In Sorrow',
+    descriptionMn: 'Гүнж Серафина хунтайж Каэлд дурласан боловч хунтайж түүний эгчид итгэн охиныг гомдоож зовооно. Бүсгүй асар их уй гашуу дунд өөрийн хайрыг золиослон байж ордны хууран мэхлэлтийг илчлэхээр шийднэ.',
+    descriptionEn: 'Princess Seraphina fell in love with Prince Kael, only to be betrayed and tormented when he believed her sister’s deceit. Amidst overwhelming sorrow, she sacrifices her love to expose the palace conspiracy.',
+    year: 2026,
+    country: 'Хятад',
+    duration: 'нийт 1ц 40 мин',
+    genre: {
+      mn: 'Драм • Хайр дурлал',
+      en: 'Drama • Romance'
+    },
+    genres: ['Драм', 'Хайр дурлал', 'Уран сэтгэмж'],
+    genreMn: 'Драм • Хайр дурлал',
+    genreEn: 'Drama • Romance',
+    rating: '8.2',
+    ageRating: '16+',
+    quality: '1080p Full HD',
+    isPremium: true,
+    minPlan: 'basic',
+    director: {
+      mn: 'Линь Вэй',
+      en: 'Lin Wei'
+    },
+    directorMn: 'Линь Вэй',
+    directorEn: 'Lin Wei',
+    cast: {
+      mn: 'Серафина, Хунтайж Каэл, Элена',
+      en: 'Seraphina, Prince Kael, Elena'
+    },
+    castMn: 'Серафина, Хунтайж Каэл, Элена',
+    castEn: 'Seraphina, Prince Kael, Elena',
+    bannerUrl: '/src/assets/images/poster_quantum_shaman_1794122760152.jpg',
+    backdropUrl: '/src/assets/images/poster_quantum_shaman_1794122760152.jpg',
+    posterUrl: '/src/assets/images/poster_quantum_shaman_1794122760152.jpg',
+    trailerUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    videoSource: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    tags: ['Монгол хадмалтай', 'Эхний 6 анги үнэгүй', 'Богино драм', 'Драм'],
+    type: 'series',
+    featured: true,
+    trending: true,
+    published: true,
+    hasMongolianSubtitles: true,
+    isOriginal: true,
+    isExclusive: true,
+    isShortDrama: true,
+    totalEpisodes: 50,
+    freeEpisodes: 6,
+    unlockPrice: 4900,
+    rentalDurationHours: 72,
+    vipEnabled: true,
+    seriesStatus: 'completed',
+    top10: 1
+  },
   {
     id: 'ai-nomad-2099',
     title: {
@@ -122,6 +203,8 @@ export const MOVIES: Movie[] = [
     tags: ['Шинэ нээлт', '4K HDR', 'Топ 10', 'QPay Онцгой', 'Streamline Gold'],
     featured: true,
     trending: true,
+    isOriginal: true,
+    isExclusive: true,
     top10: 1
   },
   {
@@ -169,6 +252,7 @@ export const MOVIES: Movie[] = [
     tags: ['Dolby Atmos', 'Премиум сонголт', 'Sci-Fi'],
     featured: true,
     trending: true,
+    isOriginal: true,
     top10: 2
   },
   {
@@ -216,6 +300,8 @@ export const MOVIES: Movie[] = [
     tags: ['Премиум онцгой', 'IMAX Enhanced', '4K HDR'],
     featured: false,
     trending: true,
+    isOriginal: true,
+    isExclusive: true,
     top10: 3
   },
   {
@@ -263,6 +349,7 @@ export const MOVIES: Movie[] = [
     tags: ['Олон ангит өмнөх анги', 'Хит', '1080p Full HD'],
     featured: false,
     trending: true,
+    isOriginal: true,
     top10: 4
   },
   {
@@ -310,6 +397,60 @@ export const MOVIES: Movie[] = [
     tags: ['Үнэгүй үзвэр', 'Бүх насныханд', 'Танилцуулга'],
     featured: false,
     trending: false
+  },
+  {
+    id: 'crimson-mirage-18',
+    slug: 'crimson-mirage-18',
+    title: {
+      mn: 'Улаан Хамба: Шөнийн Нууц',
+      en: 'Crimson Velvet: Nocturne'
+    },
+    synopsis: {
+      mn: 'Насанд хүрэгчдэд зориулсан сэтгэл зүйн нууцлаг триллер. Неон гэрэлт шөнийн клубт өрнөх хаалттай ертөнцийн нууц гэрээ ба хууран мэхлэлт.',
+      en: 'An adults-only neo-noir psychological thriller set inside an underground cybernetic lounge of secrets and forbidden pacts.'
+    },
+    titleMn: 'Улаан Хамба: Шөнийн Нууц',
+    titleEn: 'Crimson Velvet: Nocturne',
+    descriptionMn: 'Насанд хүрэгчдэд зориулсан сэтгэл зүйн нууцлаг триллер. Неон гэрэлт шөнийн клубт өрнөх хаалттай ертөнцийн нууц гэрээ ба хууран мэхлэлт.',
+    descriptionEn: 'An adults-only neo-noir psychological thriller set inside an underground cybernetic lounge of secrets and forbidden pacts.',
+    year: 2026,
+    duration: '1h 58m',
+    genre: {
+      mn: 'Нео-Нуар • Мистик • 18+',
+      en: 'Neo-Noir • Mystic • 18+'
+    },
+    genres: ['Neo-Noir', 'Мистик', 'Триллер'],
+    genreMn: 'Нео-Нуар • Мистик • 18+',
+    genreEn: 'Neo-Noir • Mystic • 18+',
+    rating: '8.8',
+    ageRating: '18+',
+    quality: '4K HDR',
+    isPremium: true,
+    minPlan: 'standard',
+    director: {
+      mn: 'Э. Хатанбаатар',
+      en: 'Khatanbaatar E.'
+    },
+    directorMn: 'Э. Хатанбаатар',
+    directorEn: 'Khatanbaatar E.',
+    cast: {
+      mn: 'Анударь, Маргад, Сүүдэр-X',
+      en: 'Anudari, Margad, Shadow-X'
+    },
+    castMn: 'Анударь, Маргад, Сүүдэр-X',
+    castEn: 'Anudari, Margad, Shadow-X',
+    bannerUrl: '/src/assets/images/hero_nomad_2099_1794122759432.jpg',
+    backdropUrl: '/src/assets/images/hero_nomad_2099_1794122759432.jpg',
+    posterUrl: '/src/assets/images/hero_nomad_2099_1794122759432.jpg',
+    trailerUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4',
+    videoSource: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4',
+    videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4',
+    tags: ['18+', 'Hot+', 'Триллер', '4K HDR'],
+    type: 'movie',
+    featured: false,
+    trending: true,
+    published: true,
+    hasMongolianSubtitles: true
   }
 ];
 

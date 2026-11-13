@@ -1,7 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ExternalLink,
-  ShieldCheck,
   QrCode,
   ArrowLeft,
   Clock,
@@ -17,6 +16,7 @@ import {
 import { BANK_TRANSFER_DETAILS } from '../config/bank-details.js';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
 import { formatCurrency } from '../i18n/types.js';
+import { authFetch, copyTextToClipboard } from '../utils/api.js';
 
 interface CheckoutViewProps {
   orderNumber: string;
@@ -32,18 +32,60 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
   const t = useTranslations('Checkout');
   const { locale } = useLocale();
 
-  const [loading, setLoading] = useState(true);
-  const [order, setOrder] = useState<any>(null);
+  const getCachedOrder = () => {
+    if (typeof window === 'undefined' || !orderNumber) return null;
+    try {
+      const raw = sessionStorage.getItem(`ai_movie_order_${orderNumber}`);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const getDraftFields = () => {
+    if (typeof window === 'undefined' || !orderNumber) {
+      return { senderName: '', phone: '', transferRef: '' };
+    }
+    try {
+      const raw = sessionStorage.getItem(`ai_movie_draft_${orderNumber}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          senderName: parsed.senderName || '',
+          phone: parsed.phone || '',
+          transferRef: parsed.transferRef || ''
+        };
+      }
+    } catch {}
+    return { senderName: '', phone: '', transferRef: '' };
+  };
+
+  const initialCachedOrder = getCachedOrder();
+  const initialDraft = getDraftFields();
+
+  const [loading, setLoading] = useState(!initialCachedOrder);
+  const [order, setOrder] = useState<any>(initialCachedOrder);
   const [error, setError] = useState<string | null>(null);
-  const [activeMethod, setActiveMethod] = useState<'wire_qpay' | 'bank_transfer'>('wire_qpay');
+  const [activeMethod, setActiveMethodState] = useState<'wire_qpay' | 'bank_transfer'>(() => {
+    if (initialCachedOrder?.paymentMethod === 'bank_transfer' || initialCachedOrder?.paymentMethod === 'wire_qpay') {
+      return initialCachedOrder.paymentMethod;
+    }
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('ai_movie_payment_method');
+        if (saved === 'bank_transfer' || saved === 'wire_qpay') return saved;
+      } catch {}
+    }
+    return 'wire_qpay';
+  });
   const [simulating, setSimulating] = useState(false);
   const [simResult, setSimResult] = useState<any>(null);
-  const [timeLeft, setTimeLeft] = useState(600); // 10 minutes default payment expiration
+  const [timeLeft, setTimeLeft] = useState(600); // 10 minutes default QPay expiration
 
-  // Bank transfer submission state
-  const [senderName, setSenderName] = useState('');
-  const [phone, setPhone] = useState('');
-  const [transferRef, setTransferRef] = useState('');
+  // Bank transfer submission state (persisted across mobile app switches)
+  const [senderName, setSenderName] = useState(initialDraft.senderName);
+  const [phone, setPhone] = useState(initialDraft.phone);
+  const [transferRef, setTransferRef] = useState(initialDraft.transferRef);
   const [submittingTransfer, setSubmittingTransfer] = useState(false);
   const [transferSuccessMsg, setTransferSuccessMsg] = useState<string | null>(null);
 
@@ -52,30 +94,70 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
   const [copiedAmount, setCopiedAmount] = useState(false);
   const [copiedMemo, setCopiedMemo] = useState(false);
 
-  useEffect(() => {
-    let timer: any;
-    if (timeLeft > 0) {
-      timer = setInterval(() => setTimeLeft((prev) => Math.max(0, prev - 1)), 1000);
+  const orderRef = useRef<any>(initialCachedOrder);
+  orderRef.current = order;
+  const userSwitchedMethodRef = useRef(false);
+
+  const setActiveMethod = (method: 'wire_qpay' | 'bank_transfer') => {
+    userSwitchedMethodRef.current = true;
+    setActiveMethodState(method);
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem('ai_movie_payment_method', method);
+      } catch {}
     }
-    return () => clearInterval(timer);
-  }, [timeLeft]);
+  };
 
+  // Persist form draft in sessionStorage so switching to Khan Bank app on phone never clears inputs
   useEffect(() => {
-    fetchOrder();
-    const interval = setInterval(fetchOrder, 4000); // Poll backend internal status
-    return () => clearInterval(interval);
-  }, [orderNumber]);
-
-  const fetchOrder = async () => {
+    if (typeof window === 'undefined' || !orderNumber) return;
     try {
-      const res = await fetch(`/api/payments/${orderNumber}`);
+      sessionStorage.setItem(
+        `ai_movie_draft_${orderNumber}`,
+        JSON.stringify({ senderName, phone, transferRef })
+      );
+    } catch {}
+  }, [orderNumber, senderName, phone, transferRef]);
+
+  // Single stable interval for QPay countdown
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const fetchOrder = async (isBackgroundPoll = false) => {
+    if (!orderNumber) {
+      setError(locale === 'en' ? 'Payment order not found' : 'Төлбөрийн захиалгын мэдээлэл олдсонгүй');
+      setLoading(false);
+      return;
+    }
+
+    // Skip background polling while mobile browser tab is hidden (e.g., user is inside Khan Bank app)
+    if (isBackgroundPoll && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+
+    try {
+      const res = await authFetch(`/api/payments/${encodeURIComponent(orderNumber)}`);
       if (!res.ok) {
+        if (isBackgroundPoll && orderRef.current) {
+          // Never kick user out on transient background poll failure
+          return;
+        }
         throw new Error(locale === 'en' ? 'Payment order not found' : 'Төлбөрийн захиалгын мэдээлэл олдсонгүй');
       }
       const data = await res.json();
       setOrder(data);
-      if (data.paymentMethod) {
-        setActiveMethod(data.paymentMethod);
+      setError(null);
+      if (typeof window !== 'undefined') {
+        try {
+          sessionStorage.setItem(`ai_movie_order_${orderNumber}`, JSON.stringify(data));
+        } catch {}
+      }
+      if (data.paymentMethod && !userSwitchedMethodRef.current) {
+        setActiveMethodState(data.paymentMethod);
       }
       setLoading(false);
 
@@ -83,16 +165,39 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
         onPaymentConfirmed(orderNumber);
       }
     } catch (err: any) {
+      // If we already have order details loaded, ignore transient mobile network errors when switching apps
+      if (isBackgroundPoll || orderRef.current) {
+        setLoading(false);
+        return;
+      }
       setError(err.message);
       setLoading(false);
     }
   };
 
+  useEffect(() => {
+    userSwitchedMethodRef.current = false;
+    fetchOrder(false);
+    const interval = setInterval(() => fetchOrder(true), 6000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchOrder(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [orderNumber]);
+
   const handleSimulateWebhook = async () => {
     setSimulating(true);
     setSimResult(null);
     try {
-      const res = await fetch('/api/test/simulate-wire-payment', {
+      const res = await authFetch('/api/test/simulate-wire-payment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ orderNumber })
@@ -100,7 +205,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Simulation failed');
       setSimResult(data);
-      fetchOrder();
+      fetchOrder(true);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -114,7 +219,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
     setError(null);
 
     try {
-      const res = await fetch('/api/payments/bank-transfer/confirm', {
+      const res = await authFetch('/api/payments/bank-transfer/confirm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -135,7 +240,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
           ? (data.messageEn || data.message || 'Transfer details submitted! Waiting for Admin verification.')
           : (data.message || 'Шилжүүлгийн мэдээлэл илгээгдлээ. Админ шалгаж баталгаажуулсны дараа гишүүнчлэл идэвхжинэ.')
       );
-      fetchOrder();
+      fetchOrder(true);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -143,8 +248,8 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
     }
   };
 
-  const copyToClipboard = (text: string, type: 'account' | 'amount' | 'memo') => {
-    navigator.clipboard.writeText(text);
+  const copyToClipboard = async (text: string, type: 'account' | 'amount' | 'memo') => {
+    await copyTextToClipboard(text);
     if (type === 'account') {
       setCopiedAccount(true);
       setTimeout(() => setCopiedAccount(false), 2000);
@@ -160,7 +265,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
   const minutes = Math.floor(timeLeft / 60);
   const seconds = timeLeft % 60;
 
-  if (loading) {
+  if (loading && !order) {
     return (
       <div className="py-24 flex flex-col items-center justify-center text-slate-400">
         <div className="w-10 h-10 border-2 border-[#e5a93c] border-t-transparent rounded-full animate-spin mb-3" />
@@ -177,12 +282,22 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
         </div>
         <h2 className="text-xl font-bold text-white mb-2">{locale === 'en' ? 'Error' : 'Алдаа гарлаа'}</h2>
         <p className="text-sm text-slate-400 mb-6">{error || (locale === 'en' ? 'Order not found' : 'Захиалга олдсонгүй')}</p>
-        <button
-          onClick={onBack}
-          className="px-5 py-2.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-semibold transition"
-        >
-          {locale === 'en' ? 'Back' : 'Буцах'}
-        </button>
+        <div className="flex items-center justify-center gap-3">
+          <button
+            type="button"
+            onClick={() => fetchOrder(false)}
+            className="px-5 py-2.5 rounded-lg bg-[#e5a93c] text-black text-sm font-bold transition cursor-pointer"
+          >
+            {locale === 'en' ? 'Retry' : 'Дахин ачаалах'}
+          </button>
+          <button
+            type="button"
+            onClick={onBack}
+            className="px-5 py-2.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-semibold transition cursor-pointer"
+          >
+            {locale === 'en' ? 'Back' : 'Буцах'}
+          </button>
+        </div>
       </div>
     );
   }
@@ -194,8 +309,9 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
     : order?.planName;
 
   return (
-    <div className="py-12 px-4 sm:px-6 lg:px-8 max-w-2xl mx-auto select-none">
+    <div className="py-12 px-4 sm:px-6 lg:px-8 max-w-2xl mx-auto">
       <button
+        type="button"
         onClick={onBack}
         className="mb-6 flex items-center gap-1.5 text-xs font-semibold text-slate-400 hover:text-white transition cursor-pointer"
       >
@@ -218,12 +334,19 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
             <h1 className="text-xl font-black text-white mt-1">{t('title')}</h1>
           </div>
 
-          <div className="flex items-center gap-1.5 text-xs text-[#e5a93c] font-mono bg-amber-950/40 border border-amber-800/40 px-2.5 py-1 rounded-lg">
-            <Clock className="w-3.5 h-3.5" />
-            <span>
-              {String(minutes).padStart(2, '0')}:{String(seconds).padStart(2, '0')}
-            </span>
-          </div>
+          {activeMethod === 'bank_transfer' ? (
+            <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-semibold bg-emerald-950/40 border border-emerald-700/40 px-2.5 py-1 rounded-lg">
+              <Clock className="w-3.5 h-3.5" />
+              <span>{locale === 'en' ? '24h Active' : 'Идэвхтэй'}</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 text-xs text-[#e5a93c] font-mono bg-amber-950/40 border border-amber-800/40 px-2.5 py-1 rounded-lg">
+              <Clock className="w-3.5 h-3.5" />
+              <span>
+                {String(minutes).padStart(2, '0')}:{String(seconds).padStart(2, '0')}
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Payment Method Tabs */}
@@ -233,6 +356,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
           </div>
           <div className="grid grid-cols-2 gap-2">
             <button
+              type="button"
               onClick={() => setActiveMethod('wire_qpay')}
               className={`p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition cursor-pointer border ${
                 activeMethod === 'wire_qpay'
@@ -245,6 +369,7 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
             </button>
 
             <button
+              type="button"
               onClick={() => setActiveMethod('bank_transfer')}
               className={`p-3 rounded-xl flex items-center justify-center gap-2 text-xs font-bold transition cursor-pointer border ${
                 activeMethod === 'bank_transfer'

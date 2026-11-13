@@ -9,6 +9,9 @@ import {
   IAuditLog,
   IPasswordResetToken,
   IWebsiteSettings,
+  IEpisode,
+  ISeriesPurchase,
+  IUserPlaybackProgress,
   UserModel,
   PaymentModel,
   SubscriptionModel,
@@ -18,65 +21,264 @@ import {
   AuditLogModel,
   PasswordResetTokenModel,
   WebsiteSettingsModel,
+  EpisodeModel,
+  SeriesPurchaseModel,
+  UserPlaybackProgressModel,
   PaymentStatus,
   SubscriptionStatus
 } from './models.js';
 import crypto from 'node:crypto';
 import { hashPassword } from '../utils/crypto.js';
 import { MOVIES } from '../data/movies.js';
+import { mergeGeneratedEpisodes } from '../utils/seriesEpisodes.js';
+import { resolveSafePosterUrl, isValidPosterUrl } from '../utils/ageGateAndPosters.js';
 
 // Disable command buffering so operations never hang when disconnected
 mongoose.set('bufferCommands', false);
 
+export type DatabaseErrorCode =
+  | 'DATABASE_NOT_CONFIGURED'
+  | 'DATABASE_UNAVAILABLE'
+  | 'DATABASE_OPERATION_FAILED';
+
+export class DatabaseConnectionError extends Error {
+  public readonly code: DatabaseErrorCode;
+  public readonly statusCode: number;
+  public readonly readyState: number;
+
+  constructor(
+    message: string,
+    code: DatabaseErrorCode = 'DATABASE_UNAVAILABLE',
+    statusCode = 503,
+    readyState = mongoose.connection.readyState
+  ) {
+    super(message);
+    this.name = 'DatabaseConnectionError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.readyState = readyState;
+  }
+}
+
 let isConnected = false;
 let connectionPromise: Promise<boolean> | null = null;
+let lastConnectionError: string | null = null;
+let listenersAttached = false;
+let strictMongoModeEnabled = false;
+
+export function enableStrictMongoMode(enabled = true): void {
+  strictMongoModeEnabled = enabled;
+}
+
+export function isProductionEnvironment(): boolean {
+  return process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+}
 
 export function isMongoUriConfigured(): boolean {
   const uri = process.env.MONGODB_URI;
   return Boolean(uri && uri.trim() !== '' && !uri.includes('<') && !uri.includes('>'));
 }
 
+/**
+ * Memory fallback is strictly restricted to isolated unit tests (node --test)
+ * when MONGODB_URI is not configured and strict MongoDB mode is not enabled.
+ * All server, production, and configured-MongoDB operations must use MongoDB or fail with HTTP 503.
+ */
+export function isMemoryFallbackPermitted(): boolean {
+  if (isProductionEnvironment()) return false;
+  if (strictMongoModeEnabled || process.env.STRICT_MONGODB === '1') return false;
+  if (isMongoUriConfigured()) return false;
+
+  const isIsolatedTestEnv =
+    Boolean(process.env.NODE_TEST_CONTEXT) ||
+    process.env.NODE_ENV === 'test' ||
+    process.env.ALLOW_MEMORY_DB === '1' ||
+    process.execArgv.includes('--test') ||
+    process.argv.includes('--test');
+
+  return isIsolatedTestEnv;
+}
+
+export function getMongoReadyStateLabel(state: number = mongoose.connection.readyState): string {
+  switch (state) {
+    case 0:
+      return 'disconnected';
+    case 1:
+      return 'connected';
+    case 2:
+      return 'connecting';
+    case 3:
+      return 'disconnecting';
+    default:
+      return 'uninitialized';
+  }
+}
+
+function ensureConnectionListeners(): void {
+  if (listenersAttached) return;
+  listenersAttached = true;
+
+  mongoose.connection.on('connected', () => {
+    isConnected = true;
+    lastConnectionError = null;
+  });
+
+  mongoose.connection.on('reconnected', () => {
+    isConnected = true;
+    lastConnectionError = null;
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    isConnected = false;
+  });
+
+  mongoose.connection.on('close', () => {
+    isConnected = false;
+  });
+
+  mongoose.connection.on('error', (err: Error) => {
+    isConnected = mongoose.connection.readyState === 1;
+    lastConnectionError = err?.message || 'Unknown MongoDB connection error';
+  });
+}
+
+export function isMongoActive(): boolean {
+  return isConnected && mongoose.connection.readyState === 1;
+}
+
+export interface DatabaseStatusInfo {
+  configured: boolean;
+  connected: boolean;
+  readyState: number;
+  readyStateLabel: string;
+  mode: 'mongodb' | 'memory_dev' | 'unavailable';
+  isProduction: boolean;
+  lastError: string | null;
+}
+
+export function getDatabaseStatus(): DatabaseStatusInfo {
+  const configured = isMongoUriConfigured();
+  const readyState = mongoose.connection.readyState;
+  const connected = isConnected && readyState === 1;
+  const isProd = isProductionEnvironment();
+
+  let mode: 'mongodb' | 'memory_dev' | 'unavailable' = 'unavailable';
+  if (connected) {
+    mode = 'mongodb';
+  } else if (isMemoryFallbackPermitted()) {
+    mode = 'memory_dev';
+  }
+
+  return {
+    configured,
+    connected,
+    readyState,
+    readyStateLabel: getMongoReadyStateLabel(readyState),
+    mode,
+    isProduction: isProd,
+    lastError: lastConnectionError
+  };
+}
+
+export function normalizeStorageError(err: any): Error {
+  if (err instanceof DatabaseConnectionError) {
+    return err;
+  }
+  if (err && typeof err === 'object' && err.statusCode === 503) {
+    return err;
+  }
+
+  const errName = String(err?.name || '');
+  const errMsg = String(err?.message || '');
+  const isConnectivityFailure =
+    errName === 'MongoNetworkError' ||
+    errName === 'MongooseServerSelectionError' ||
+    errName === 'MongoServerSelectionError' ||
+    errName === 'MongoNotConnectedError' ||
+    errName === 'MongoTopologyClosedError' ||
+    errName === 'MongoWaitQueueTimeoutError' ||
+    errName === 'MongoExpiredSessionError' ||
+    errName === 'MongoNetworkTimeoutError' ||
+    /Client must be connected|buffering timed out|Topology is closed|topology was destroyed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|server selection timed out|connection .* closed/i.test(
+      errMsg
+    );
+
+  if (isConnectivityFailure) {
+    isConnected = false;
+    lastConnectionError = errMsg || 'MongoDB connectivity error';
+    return new DatabaseConnectionError(
+      `Өгөгдлийн сантай холбогдож чадсангүй: ${errMsg}`,
+      'DATABASE_UNAVAILABLE',
+      503
+    );
+  }
+
+  return err instanceof Error ? err : new Error(String(err));
+}
+
 export async function connectDB(): Promise<boolean> {
+  ensureConnectionListeners();
+
   const uri = process.env.MONGODB_URI;
+
   if (!uri || uri.trim() === '' || uri.includes('<') || uri.includes('>')) {
-    if (process.env.NODE_ENV === 'production') {
-      const err = new Error('MONGODB_URI is not configured in production.');
-      (err as any).code = 'DATABASE_NOT_CONFIGURED';
-      (err as any).statusCode = 503;
-      throw err;
+    isConnected = false;
+    if (!isMemoryFallbackPermitted()) {
+      lastConnectionError = 'MONGODB_URI is not configured.';
+      throw new DatabaseConnectionError(
+        'MONGODB_URI is not configured.',
+        'DATABASE_NOT_CONFIGURED',
+        503
+      );
     }
     return false;
   }
 
-  if (isConnected && mongoose.connection.readyState === 1) return true;
-  if (mongoose.connection.readyState === 1) {
-    isConnected = true;
+  if (isConnected && mongoose.connection.readyState === 1) {
     return true;
   }
-  if (connectionPromise) return connectionPromise;
+  if (mongoose.connection.readyState === 1) {
+    isConnected = true;
+    lastConnectionError = null;
+    return true;
+  }
+  if (connectionPromise) {
+    return connectionPromise;
+  }
 
   connectionPromise = (async () => {
     try {
-      await mongoose.connect(uri, {
+      await mongoose.connect(uri.trim(), {
         serverSelectionTimeoutMS: 5000,
         connectTimeoutMS: 5000,
+        socketTimeoutMS: 20000,
         maxPoolSize: 10
       });
       isConnected = mongoose.connection.readyState === 1;
       if (isConnected) {
+        lastConnectionError = null;
         console.log('[Database] Connected successfully to MongoDB Atlas');
+        return true;
       }
-      return isConnected;
+
+      lastConnectionError = `Unexpected Mongoose readyState after connect: ${mongoose.connection.readyState}`;
+      throw new DatabaseConnectionError(
+        `MongoDB connection did not reach ready state (${getMongoReadyStateLabel()}).`,
+        'DATABASE_UNAVAILABLE',
+        503
+      );
     } catch (err) {
       isConnected = false;
-      console.error('[Database] MongoDB connection failed:', (err as Error).message);
-      if (process.env.NODE_ENV === 'production') {
-        const dbErr = new Error(`MongoDB connection failed: ${(err as Error).message}`);
-        (dbErr as any).code = 'DATABASE_UNAVAILABLE';
-        (dbErr as any).statusCode = 503;
-        throw dbErr;
-      }
-      return false;
+      const message = (err as Error)?.message || 'Unknown connection error';
+      lastConnectionError = message;
+      console.error('[Database] MongoDB connection failed:', message);
+
+      if (err instanceof DatabaseConnectionError) throw err;
+      throw new DatabaseConnectionError(
+        `MongoDB connection failed: ${message}`,
+        'DATABASE_UNAVAILABLE',
+        503
+      );
     } finally {
       connectionPromise = null;
     }
@@ -85,18 +287,46 @@ export async function connectDB(): Promise<boolean> {
   return connectionPromise;
 }
 
-export function isMongoActive(): boolean {
-  return isConnected && mongoose.connection.readyState === 1;
+/**
+ * Enforces that database operations never silently fall back to ephemeral memory storage
+ * when MongoDB is unavailable. Throws DatabaseConnectionError (HTTP 503) if not connected.
+ */
+export function requireDatabaseConnection(isMongo: boolean): void {
+  if (!isMemoryFallbackPermitted()) {
+    if (!isMongoUriConfigured()) {
+      throw new DatabaseConnectionError(
+        'MONGODB_URI is not configured.',
+        'DATABASE_NOT_CONFIGURED',
+        503
+      );
+    }
+    if (!isMongo || !isMongoActive() || mongoose.connection.readyState !== 1) {
+      throw new DatabaseConnectionError(
+        'MongoDB is unavailable; database operations cannot use the in-memory store.',
+        'DATABASE_UNAVAILABLE',
+        503
+      );
+    }
+  }
 }
 
-/** Production operations must never fall back to ephemeral memory data. */
-function requireMongoInProduction(isMongo: boolean): void {
-  if (process.env.NODE_ENV === 'production' && !isMongo) {
-    const err = new Error('MongoDB is unavailable; production data cannot use the in-memory store.');
-    (err as any).code = 'DATABASE_UNAVAILABLE';
-    (err as any).statusCode = 503;
-    throw err;
+export const requireMongoInProduction = requireDatabaseConnection;
+
+/**
+ * Checks connection status before any database operation and throws 503 DatabaseConnectionError
+ * if MongoDB is unavailable instead of falling back to memory storage.
+ */
+export async function ensureDatabaseConnection(): Promise<boolean> {
+  const isMongo = await connectDB();
+  requireDatabaseConnection(isMongo);
+  if (isMongo && (!isMongoActive() || mongoose.connection.readyState !== 1)) {
+    throw new DatabaseConnectionError(
+      'MongoDB connection is not active (readyState !== 1).',
+      'DATABASE_UNAVAILABLE',
+      503
+    );
   }
+  return isMongo;
 }
 
 export function hashResetToken(rawToken: string): string {
@@ -122,9 +352,9 @@ export function normalizeMovieDoc(d: any): IMovie {
   const directorEn = d.directorEn || d.director?.en || directorMn || '';
   const castMn = d.castMn || d.cast?.mn || '';
   const castEn = d.castEn || d.cast?.en || castMn || '';
-  const posterUrl = d.posterUrl || '';
-  const backdropUrl = d.backdropUrl || d.bannerUrl || posterUrl;
-  const bannerUrl = d.bannerUrl || backdropUrl || posterUrl;
+  const posterUrl = resolveSafePosterUrl(d.posterUrl, id);
+  const backdropUrl = resolveSafePosterUrl(d.backdropUrl || d.bannerUrl || posterUrl, id);
+  const bannerUrl = resolveSafePosterUrl(d.bannerUrl || backdropUrl || posterUrl, id);
   const videoUrl = d.videoUrl || d.videoSource || '';
   const videoSource = d.videoSource || videoUrl;
 
@@ -161,7 +391,9 @@ export function normalizeMovieDoc(d: any): IMovie {
     castMn,
     castEn,
     language: d.language || 'mn',
-    type: d.type || 'movie',
+    country: d.country || 'Монгол',
+    originalTitle: d.originalTitle || enTitle,
+    type: d.type === 'series' ? 'series' : 'movie',
     featured: Boolean(d.featured),
     trending: d.trending !== undefined ? Boolean(d.trending) : Boolean(d.featured),
     top10: d.top10 !== undefined ? d.top10 : undefined,
@@ -170,6 +402,16 @@ export function normalizeMovieDoc(d: any): IMovie {
     published: d.published !== false,
     viewsCount: Number(d.viewsCount) || 0,
     tags: Array.isArray(d.tags) && d.tags.length > 0 ? d.tags : genres,
+    hasMongolianSubtitles: d.hasMongolianSubtitles !== false,
+    isOriginal: Boolean(d.isOriginal),
+    isExclusive: Boolean(d.isExclusive),
+    isShortDrama: Boolean(d.isShortDrama),
+    totalEpisodes: Math.max(1, Number(d.totalEpisodes) || (d.type === 'series' ? 50 : 1)),
+    freeEpisodes: Math.max(0, Number(d.freeEpisodes !== undefined ? d.freeEpisodes : d.type === 'series' ? 6 : 0)),
+    unlockPrice: Math.max(0, Number(d.unlockPrice) || 4900),
+    rentalDurationHours: Math.max(1, Number(d.rentalDurationHours) || 72),
+    vipEnabled: d.vipEnabled !== false,
+    seriesStatus: d.seriesStatus === 'ongoing' ? 'ongoing' : 'completed',
     createdAt: d.createdAt ? new Date(d.createdAt) : new Date(),
     updatedAt: d.updatedAt ? new Date(d.updatedAt) : new Date()
   };
@@ -181,6 +423,9 @@ function normalizePaymentDoc(doc: any): IPayment {
     userId: doc.userId,
     orderNumber: doc.orderNumber,
     planId: doc.planId,
+    seriesId: doc.seriesId || undefined,
+    accessType: doc.accessType || undefined,
+    rentalDurationHours: doc.rentalDurationHours ? Number(doc.rentalDurationHours) : undefined,
     paymentMethod: doc.paymentMethod || 'wire_qpay',
     wirePaymentIntentId: doc.wirePaymentIntentId,
     wireCheckoutSessionId: doc.wireCheckoutSessionId || undefined,
@@ -207,13 +452,13 @@ export const DEFAULT_WEBSITE_SETTINGS: IWebsiteSettings = {
   taglineMn: 'Киноны Дараагийн Үе',
   taglineEn: 'Next-Gen AI Cinema',
   featuredMovieId: 'ai-nomad-2099',
-  announcementMn: 'AI Кино платформд тавтай морилно уу. 4K HDR стриминг болон Wire.mn QPay төлбөрийн систем.',
-  announcementEn: 'Welcome to SODON AI Movie 4K HDR streaming platform.',
+  announcementMn: '',
+  announcementEn: '',
   maintenanceMode: false,
   allowRegistrations: true,
   primaryCurrency: 'MNT',
   defaultLocale: 'mn',
-  contactEmail: 'support@aimovie.mn',
+  contactEmail: 'gantomor6174@gmail.com',
   contactPhone: '+976 7711-2099',
   streamingQualityDefault: '4K HDR',
   bankTransferEnabled: true,
@@ -248,6 +493,9 @@ class MemoryDatabase {
   public auditLogs: IAuditLog[] = [];
   public passwordResetTokens: Map<string, IPasswordResetToken> = new Map();
   public settings: IWebsiteSettings = { ...DEFAULT_WEBSITE_SETTINGS };
+  public episodes: Map<string, IEpisode[]> = new Map();
+  public seriesPurchases: Map<string, ISeriesPurchase> = new Map();
+  public playbackProgress: Map<string, IUserPlaybackProgress> = new Map();
 
   constructor() {
     if (process.env.NODE_ENV !== 'production') {
@@ -357,6 +605,24 @@ class MemoryDatabase {
         updatedAt: new Date('2026-01-01')
       });
       this.movies.set(movieDoc.id, movieDoc);
+      if (movieDoc.type === 'series') {
+        const eps = mergeGeneratedEpisodes({
+          seriesId: movieDoc.id,
+          existingEpisodes: [],
+          totalEpisodes: movieDoc.totalEpisodes || 50,
+          freeEpisodes: movieDoc.freeEpisodes ?? 6,
+          defaultVideoUrl: movieDoc.videoUrl,
+          defaultThumbnailUrl: movieDoc.posterUrl
+        }).map((e) => ({
+          ...e,
+          id: `${movieDoc.id}_ep_${e.episodeNumber}`,
+          isPublished: true,
+          published: true,
+          createdAt: new Date('2026-01-01'),
+          updatedAt: new Date('2026-01-01')
+        }));
+        this.episodes.set(movieDoc.id, eps);
+      }
     }
   }
 
@@ -369,6 +635,9 @@ class MemoryDatabase {
     this.categories.clear();
     this.auditLogs = [];
     this.passwordResetTokens.clear();
+    this.episodes.clear();
+    this.seriesPurchases.clear();
+    this.playbackProgress.clear();
     this.settings = { ...DEFAULT_WEBSITE_SETTINGS };
     if (process.env.NODE_ENV !== 'production') {
       this.seedDemoData();
@@ -378,7 +647,7 @@ class MemoryDatabase {
 
 export const memDb = new MemoryDatabase();
 
-export const Storage = {
+const rawStorage = {
   // -------------------------------------------------------------
   // Payments
   // -------------------------------------------------------------
@@ -515,6 +784,84 @@ export const Storage = {
     return null;
   },
 
+  async submitBankTransferForReview(params: {
+    orderNumber: string;
+    userId: string;
+    senderName?: string;
+    phone?: string;
+    transferRef?: string;
+    fallbackUserName?: string;
+  }): Promise<IPayment> {
+    const orderNumber = (params.orderNumber || '').trim();
+    if (!orderNumber) {
+      const err = new Error('Захиалгын дугаар (orderNumber) шаардлагатай.');
+      (err as any).code = 'MISSING_ORDER_NUMBER';
+      (err as any).statusCode = 400;
+      throw err;
+    }
+
+    const payment = await this.getPaymentByOrderNumber(orderNumber);
+    if (!payment) {
+      const err = new Error('Захиалга олдсонгүй.');
+      (err as any).code = 'ORDER_NOT_FOUND';
+      (err as any).statusCode = 404;
+      throw err;
+    }
+
+    if (payment.userId !== params.userId) {
+      const err = new Error('Энэ захиалгад хандах эрхгүй байна.');
+      (err as any).code = 'UNAUTHORIZED_ACCESS';
+      (err as any).statusCode = 403;
+      throw err;
+    }
+
+    if (payment.paymentMethod && payment.paymentMethod !== 'bank_transfer') {
+      const err = new Error('Зөвхөн банкны дансны шилжүүлгийн захиалгыг энэ хэсгээр илгээх боломжтой.');
+      (err as any).code = 'INVALID_PAYMENT_METHOD';
+      (err as any).statusCode = 400;
+      throw err;
+    }
+
+    if (payment.status === 'PAID') {
+      const err = new Error('Захиалга аль хэдийн баталгаажсан байна.');
+      (err as any).code = 'ORDER_ALREADY_PAID';
+      (err as any).statusCode = 409;
+      throw err;
+    }
+
+    if (payment.status === 'EXPIRED' || payment.status === 'FAILED') {
+      const err = new Error('Энэ захиалгын хүчинтэй хугацаа дууссан байна. Шинэ захиалга үүсгэнэ үү.');
+      (err as any).code = 'ORDER_EXPIRED';
+      (err as any).statusCode = 400;
+      throw err;
+    }
+
+    const cleanSender = params.senderName ? String(params.senderName).trim() : '';
+    const cleanPhone = params.phone ? String(params.phone).trim() : '';
+    const senderFormatted = cleanSender
+      ? `${cleanSender}${cleanPhone ? ` (${cleanPhone})` : ''}`
+      : params.fallbackUserName || 'Хэрэглэгч';
+    const refString = params.transferRef
+      ? String(params.transferRef).trim()
+      : `TXN-${Date.now().toString().slice(-6)}`;
+
+    // Security rule: User submission MUST keep payment in PENDING_REVIEW until an admin explicitly approves it.
+    const updated = await this.updatePaymentStatus(payment.orderNumber, 'PENDING_REVIEW', {
+      bankSenderName: senderFormatted,
+      bankTransferRef: refString,
+      previousStatus: payment.status
+    });
+
+    if (!updated) {
+      const err = new Error('Шилжүүлгийн мэдээлэл хадгалахад алдаа гарлаа.');
+      (err as any).code = 'PAYMENT_UPDATE_FAILED';
+      (err as any).statusCode = 500;
+      throw err;
+    }
+
+    return updated;
+  },
+
   async approveBankTransferPayment(params: {
     idOrOrderNumber: string;
     adminId: string;
@@ -524,6 +871,23 @@ export const Storage = {
     if (!existing) {
       const err = new Error('Төлбөрийн захиалга олдсонгүй.');
       (err as any).code = 'ORDER_NOT_FOUND';
+      (err as any).statusCode = 404;
+      throw err;
+    }
+
+    if (existing.status === 'PAID') {
+      const err = new Error('Энэ захиалга аль хэдийн PAID төлөвт орж баталгаажсан байна.');
+      (err as any).code = 'ORDER_ALREADY_PAID';
+      (err as any).statusCode = 409;
+      throw err;
+    }
+
+    if (existing.status !== 'PENDING_REVIEW' && existing.status !== 'PENDING') {
+      const err = new Error(
+        `Зөвхөн хүлээгдэж буй (PENDING_REVIEW / PENDING) захиалгыг баталгаажуулах боломжтой. Одоогийн төлөв: ${existing.status}`
+      );
+      (err as any).code = 'INVALID_PAYMENT_STATE';
+      (err as any).statusCode = 400;
       throw err;
     }
 
@@ -542,12 +906,33 @@ export const Storage = {
       throw new Error('Төлбөрийн төлөв шинэчлэхэд алдаа гарлаа.');
     }
 
-    const subscription = await this.activateSubscription({
-      userId: existing.userId,
-      planId: existing.planId,
-      paymentId: existing.orderNumber,
-      durationDays: 30
-    });
+    let subscription: ISubscription | null = null;
+    if (existing.seriesId) {
+      const durationHours = existing.rentalDurationHours || 72;
+      const expiresAt =
+        existing.accessType === 'permanent'
+          ? null
+          : new Date(now.getTime() + durationHours * 3600 * 1000);
+      await this.recordSeriesPurchase({
+        userId: existing.userId,
+        seriesId: existing.seriesId,
+        accessType: existing.accessType === 'permanent' ? 'permanent' : 'rental',
+        amount: existing.amount,
+        currency: existing.currency || 'MNT',
+        paymentId: existing.orderNumber,
+        orderNumber: existing.orderNumber,
+        status: 'ACTIVE',
+        purchasedAt: now,
+        expiresAt
+      });
+    } else {
+      subscription = await this.activateSubscription({
+        userId: existing.userId,
+        planId: existing.planId,
+        paymentId: existing.orderNumber,
+        durationDays: 30
+      });
+    }
 
     await this.recordAuditLog({
       adminId: params.adminId,
@@ -558,13 +943,14 @@ export const Storage = {
         adminId: params.adminId,
         paymentId: existing.id || existing.orderNumber,
         orderNumber: existing.orderNumber,
+        seriesId: existing.seriesId || null,
         previousStatus,
         newStatus: 'PAID',
         verifiedAt: now.toISOString()
       })
     });
 
-    return { payment: updatedPayment, subscription };
+    return { payment: updatedPayment, subscription: subscription as any };
   },
 
   async rejectBankTransferPayment(params: {
@@ -577,6 +963,14 @@ export const Storage = {
     if (!existing) {
       const err = new Error('Төлбөрийн захиалга олдсонгүй.');
       (err as any).code = 'ORDER_NOT_FOUND';
+      (err as any).statusCode = 404;
+      throw err;
+    }
+
+    if (existing.status === 'PAID') {
+      const err = new Error('Аль хэдийн баталгаажсан (PAID) захиалгыг татгалзах боломжгүй.');
+      (err as any).code = 'ORDER_ALREADY_PAID';
+      (err as any).statusCode = 409;
       throw err;
     }
 
@@ -1082,12 +1476,16 @@ export const Storage = {
         filter.genres = { $in: [new RegExp(options.genre, 'i')] };
       }
       if (options?.search) {
-        const s = options.search;
+        const escapedSearch = options.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(escapedSearch, 'i');
         filter.$or = [
-          { 'title.mn': new RegExp(s, 'i') },
-          { 'title.en': new RegExp(s, 'i') },
-          { titleMn: new RegExp(s, 'i') },
-          { titleEn: new RegExp(s, 'i') }
+          { 'title.mn': regex },
+          { 'title.en': regex },
+          { titleMn: regex },
+          { titleEn: regex },
+          { directorMn: regex },
+          { directorEn: regex },
+          { genreMn: regex }
         ];
       }
 
@@ -1212,7 +1610,9 @@ export const Storage = {
       castMn,
       castEn,
       language: data.language || 'mn',
-      type: data.type || 'movie',
+      country: data.country || 'Монгол',
+      originalTitle: data.originalTitle || enTitle,
+      type: data.type === 'series' ? 'series' : 'movie',
       featured: Boolean(data.featured),
       trending: data.trending !== undefined ? Boolean(data.trending) : Boolean(data.featured),
       isPremium: data.isPremium !== false,
@@ -1220,14 +1620,25 @@ export const Storage = {
       published: data.published !== false,
       viewsCount: 0,
       tags: data.tags && data.tags.length > 0 ? data.tags : genres,
+      hasMongolianSubtitles: data.hasMongolianSubtitles !== false,
+      isOriginal: Boolean(data.isOriginal),
+      isExclusive: Boolean(data.isExclusive),
+      isShortDrama: Boolean(data.isShortDrama),
+      totalEpisodes: Math.max(1, Number(data.totalEpisodes) || (data.type === 'series' ? 50 : 1)),
+      freeEpisodes: Math.max(0, Number(data.freeEpisodes !== undefined ? data.freeEpisodes : data.type === 'series' ? 6 : 0)),
+      unlockPrice: Math.max(0, Number(data.unlockPrice) || 4900),
+      rentalDurationHours: Math.max(1, Number(data.rentalDurationHours) || 72),
+      vipEnabled: data.vipEnabled !== false,
+      seriesStatus: data.seriesStatus === 'ongoing' ? 'ongoing' : 'completed',
       createdAt: now,
       updatedAt: now
     });
 
+    let savedMovie = moviePayload;
     if (isMongo) {
       try {
         const createdDoc = await MovieModel.create(moviePayload);
-        return normalizeMovieDoc(createdDoc.toObject());
+        savedMovie = normalizeMovieDoc(createdDoc.toObject());
       } catch (err: any) {
         if (err?.code === 11000) {
           const dupErr = new Error(`Энэ slug ("${slug}") аль хэдийн бүртгэгдсэн байна.`);
@@ -1237,10 +1648,15 @@ export const Storage = {
         }
         throw err;
       }
+    } else {
+      memDb.movies.set(moviePayload.id, moviePayload);
     }
 
-    memDb.movies.set(moviePayload.id, moviePayload);
-    return moviePayload;
+    if (savedMovie.type === 'series') {
+      await this.ensureSeriesEpisodes(savedMovie);
+    }
+
+    return savedMovie;
   },
 
   async updateMovie(
@@ -1309,17 +1725,23 @@ export const Storage = {
       updatedAt: new Date()
     });
 
+    let savedMovie: IMovie | null = merged;
     if (isMongo) {
       const updatedDoc = await MovieModel.findOneAndUpdate(
         { $or: [{ id: existing.id }, { slug: existing.slug }] },
         merged,
         { new: true }
       ).lean();
-      return updatedDoc ? normalizeMovieDoc(updatedDoc) : null;
+      savedMovie = updatedDoc ? normalizeMovieDoc(updatedDoc) : null;
+    } else {
+      memDb.movies.set(existing.id, merged);
     }
 
-    memDb.movies.set(existing.id, merged);
-    return merged;
+    if (savedMovie && savedMovie.type === 'series') {
+      await this.ensureSeriesEpisodes(savedMovie);
+    }
+
+    return savedMovie;
   },
 
   async deleteMovie(id: string): Promise<boolean> {
@@ -1328,11 +1750,15 @@ export const Storage = {
 
     if (isMongo) {
       const deleted = await MovieModel.findOneAndDelete({ $or: [{ id }, { slug: id }] }).lean();
+      if (deleted) {
+        await EpisodeModel.deleteMany({ seriesId: (deleted as any).id || id });
+      }
       return Boolean(deleted);
     }
 
     const existing = await this.getMovieById(id);
     if (!existing) return false;
+    memDb.episodes.delete(existing.id);
     return memDb.movies.delete(existing.id);
   },
 
@@ -1879,5 +2305,523 @@ export const Storage = {
     }
 
     return { success: true, message: 'Нууц үг амжилттай шинэчлэгдлээ.' };
+  },
+
+  // -------------------------------------------------------------
+  // TV Series Episodes Management
+  // -------------------------------------------------------------
+  async ensureSeriesEpisodes(movie: IMovie): Promise<IEpisode[]> {
+    const totalEpisodes = Math.max(1, Number(movie.totalEpisodes) || 50);
+    const freeEpisodes = Math.max(0, Number(movie.freeEpisodes ?? 6));
+    const existing = await this.getEpisodesBySeriesId(movie.id, false);
+    const merged = mergeGeneratedEpisodes({
+      seriesId: movie.id,
+      existingEpisodes: existing,
+      totalEpisodes,
+      freeEpisodes,
+      defaultVideoUrl: movie.videoUrl || movie.videoSource,
+      defaultThumbnailUrl: movie.posterUrl
+    });
+    return this.bulkSaveEpisodes(movie.id, merged, freeEpisodes);
+  },
+
+  async getEpisodesBySeriesId(seriesId: string, publishedOnly = false): Promise<IEpisode[]> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    if (isMongo) {
+      const query: any = { seriesId };
+      if (publishedOnly) query.published = { $ne: false };
+      const docs = await EpisodeModel.find(query).sort({ episodeNumber: 1 }).lean();
+      if (docs.length === 0) {
+        const movie = await this.getMovieById(seriesId);
+        if (movie && movie.type === 'series') {
+          const generated = mergeGeneratedEpisodes({
+            seriesId: movie.id,
+            existingEpisodes: [],
+            totalEpisodes: movie.totalEpisodes || 50,
+            freeEpisodes: movie.freeEpisodes ?? 6,
+            defaultVideoUrl: movie.videoUrl || movie.videoSource,
+            defaultThumbnailUrl: movie.posterUrl
+          });
+          const saved = await this.bulkSaveEpisodes(movie.id, generated, movie.freeEpisodes ?? 6);
+          return publishedOnly ? saved.filter((e) => e.published !== false && e.isPublished !== false) : saved;
+        }
+      }
+      return docs.map((d: any) => ({
+        id: d._id?.toString() || d.id || `${seriesId}_ep_${d.episodeNumber}`,
+        seriesId: d.seriesId,
+        episodeNumber: Number(d.episodeNumber),
+        title: d.title || `${d.episodeNumber}-р анги`,
+        titleEn: d.titleEn || `Episode ${d.episodeNumber}`,
+        duration: d.duration || '2 мин',
+        videoUrl: d.videoUrl || '',
+        thumbnailUrl: d.thumbnailUrl || '',
+        subtitleUrlMn: d.subtitleUrlMn || '',
+        isFree: Boolean(d.isFree),
+        isPublished: d.isPublished !== false && d.published !== false,
+        published: d.published !== false && d.isPublished !== false,
+        order: Number(d.order || d.episodeNumber),
+        createdAt: d.createdAt,
+        updatedAt: d.updatedAt
+      }));
+    }
+
+    let list = memDb.episodes.get(seriesId) || [];
+    if (list.length === 0) {
+      const movie = await this.getMovieById(seriesId);
+      if (movie && movie.type === 'series') {
+        const generated = mergeGeneratedEpisodes({
+          seriesId: movie.id,
+          existingEpisodes: [],
+          totalEpisodes: movie.totalEpisodes || 50,
+          freeEpisodes: movie.freeEpisodes ?? 6,
+          defaultVideoUrl: movie.videoUrl || movie.videoSource,
+          defaultThumbnailUrl: movie.posterUrl
+        });
+        list = await this.bulkSaveEpisodes(movie.id, generated, movie.freeEpisodes ?? 6);
+      }
+    }
+    if (publishedOnly) {
+      list = list.filter((e) => e.published !== false && e.isPublished !== false);
+    }
+    return [...list].sort((a, b) => a.episodeNumber - b.episodeNumber);
+  },
+
+  async upsertEpisode(seriesId: string, episodeData: Partial<IEpisode>): Promise<IEpisode> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    const movie = await this.getMovieById(seriesId);
+    const freeCount = movie?.freeEpisodes ?? 6;
+    const epNum = Math.max(1, Math.floor(Number(episodeData.episodeNumber) || 1));
+    const isFree = episodeData.isFree !== undefined ? Boolean(episodeData.isFree) : epNum <= freeCount;
+    const isPub = episodeData.published !== false && episodeData.isPublished !== false;
+
+    const payload: IEpisode = {
+      id: episodeData.id || `${seriesId}_ep_${epNum}`,
+      seriesId,
+      episodeNumber: epNum,
+      title: (episodeData.title || `${epNum}-р анги`).trim(),
+      titleEn: (episodeData.titleEn || `Episode ${epNum}`).trim(),
+      duration: (episodeData.duration || '2 мин').trim(),
+      videoUrl: (episodeData.videoUrl || movie?.videoUrl || '').trim(),
+      thumbnailUrl: (episodeData.thumbnailUrl ?? movie?.posterUrl ?? '').trim(),
+      subtitleUrlMn: (episodeData.subtitleUrlMn || '').trim(),
+      isFree,
+      isPublished: isPub,
+      published: isPub,
+      order: Number(episodeData.order || epNum),
+      updatedAt: new Date()
+    };
+
+    if (isMongo) {
+      const doc = await EpisodeModel.findOneAndUpdate(
+        { seriesId, episodeNumber: epNum },
+        { $set: payload },
+        { upsert: true, new: true }
+      ).lean();
+      return {
+        ...payload,
+        id: (doc as any)?._id?.toString() || `${seriesId}_ep_${epNum}`
+      };
+    }
+
+    const list = memDb.episodes.get(seriesId) || [];
+    const idx = list.findIndex((e) => e.episodeNumber === epNum);
+    const item: IEpisode = {
+      ...payload,
+      id: `${seriesId}_ep_${epNum}`,
+      createdAt: idx >= 0 ? list[idx].createdAt : new Date()
+    };
+    if (idx >= 0) {
+      list[idx] = item;
+    } else {
+      list.push(item);
+    }
+    list.sort((a, b) => a.episodeNumber - b.episodeNumber);
+    memDb.episodes.set(seriesId, list);
+    return item;
+  },
+
+  async bulkSaveEpisodes(
+    seriesId: string,
+    episodes: Partial<IEpisode>[],
+    freeEpisodesOverride?: number
+  ): Promise<IEpisode[]> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    const movie = await this.getMovieById(seriesId);
+    const freeCount =
+      freeEpisodesOverride !== undefined ? freeEpisodesOverride : (movie?.freeEpisodes ?? 6);
+
+    const normalizedList: IEpisode[] = episodes
+      .map((ep, idx) => {
+        const epNum = Math.max(1, Math.floor(Number(ep.episodeNumber) || idx + 1));
+        const isFree =
+          freeEpisodesOverride !== undefined
+            ? epNum <= freeCount
+            : ep.isFree !== undefined
+            ? Boolean(ep.isFree)
+            : epNum <= freeCount;
+        const isPub = ep.published !== false && ep.isPublished !== false;
+
+        return {
+          id: ep.id || `${seriesId}_ep_${epNum}`,
+          seriesId,
+          episodeNumber: epNum,
+          title: (ep.title || `${epNum}-р анги`).trim(),
+          titleEn: (ep.titleEn || `Episode ${epNum}`).trim(),
+          duration: (ep.duration || '2 мин').trim(),
+          videoUrl: (ep.videoUrl || movie?.videoUrl || '').trim(),
+          thumbnailUrl: (ep.thumbnailUrl ?? movie?.posterUrl ?? '').trim(),
+          subtitleUrlMn: (ep.subtitleUrlMn || '').trim(),
+          isFree,
+          isPublished: isPub,
+          published: isPub,
+          order: Number(ep.order || epNum),
+          updatedAt: new Date()
+        };
+      })
+      .sort((a, b) => a.episodeNumber - b.episodeNumber);
+
+    if (isMongo) {
+      if (normalizedList.length > 0) {
+        const ops = normalizedList.map((ep) => ({
+          updateOne: {
+            filter: { seriesId, episodeNumber: ep.episodeNumber },
+            update: { $set: ep },
+            upsert: true
+          }
+        }));
+        await EpisodeModel.bulkWrite(ops);
+      }
+      const docs = await EpisodeModel.find({ seriesId }).sort({ episodeNumber: 1 }).lean();
+      return docs.map((d: any) => ({
+        id: d._id?.toString() || `${seriesId}_ep_${d.episodeNumber}`,
+        seriesId: d.seriesId,
+        episodeNumber: Number(d.episodeNumber),
+        title: d.title,
+        titleEn: d.titleEn,
+        duration: d.duration,
+        videoUrl: d.videoUrl,
+        thumbnailUrl: d.thumbnailUrl,
+        subtitleUrlMn: d.subtitleUrlMn,
+        isFree: Boolean(d.isFree),
+        isPublished: d.isPublished !== false && d.published !== false,
+        published: d.published !== false && d.isPublished !== false,
+        order: Number(d.order || d.episodeNumber),
+        createdAt: d.createdAt,
+        updatedAt: d.updatedAt
+      }));
+    }
+
+    const withIds = normalizedList.map((ep) => ({
+      ...ep,
+      id: `${seriesId}_ep_${ep.episodeNumber}`,
+      createdAt: new Date()
+    }));
+    memDb.episodes.set(seriesId, withIds);
+    return withIds;
+  },
+
+  async deleteEpisode(seriesId: string, episodeIdOrNumber: string | number): Promise<boolean> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    const num = Number(episodeIdOrNumber);
+    if (isMongo) {
+      if (Number.isFinite(num) && num > 0) {
+        const res = await EpisodeModel.findOneAndDelete({ seriesId, episodeNumber: num }).lean();
+        return Boolean(res);
+      }
+      if (mongoose.Types.ObjectId.isValid(String(episodeIdOrNumber))) {
+        const res = await EpisodeModel.findOneAndDelete({ _id: episodeIdOrNumber, seriesId }).lean();
+        return Boolean(res);
+      }
+      return false;
+    }
+
+    const list = memDb.episodes.get(seriesId) || [];
+    const filtered = list.filter(
+      (e) => e.episodeNumber !== num && e.id !== String(episodeIdOrNumber)
+    );
+    memDb.episodes.set(seriesId, filtered);
+    return filtered.length !== list.length;
+  },
+
+  // -------------------------------------------------------------
+  // Series Rentals & Permanent Unlocks
+  // -------------------------------------------------------------
+  async getActiveSeriesPurchase(userId: string, seriesId: string): Promise<ISeriesPurchase | null> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+    const now = new Date();
+
+    if (isMongo) {
+      const doc = await SeriesPurchaseModel.findOne({
+        userId,
+        seriesId,
+        status: 'ACTIVE',
+        $or: [{ accessType: 'permanent' }, { expiresAt: null }, { expiresAt: { $gt: now } }]
+      })
+        .sort({ purchasedAt: -1 })
+        .lean();
+
+      if (!doc) return null;
+      return {
+        id: (doc as any)._id?.toString(),
+        userId: doc.userId,
+        seriesId: doc.seriesId,
+        accessType: doc.accessType,
+        amount: doc.amount,
+        currency: doc.currency,
+        paymentId: doc.paymentId,
+        orderNumber: doc.orderNumber,
+        status: doc.status,
+        purchasedAt: doc.purchasedAt,
+        expiresAt: doc.expiresAt
+      };
+    }
+
+    for (const p of memDb.seriesPurchases.values()) {
+      if (
+        p.userId === userId &&
+        p.seriesId === seriesId &&
+        p.status === 'ACTIVE' &&
+        (p.accessType === 'permanent' || !p.expiresAt || new Date(p.expiresAt).getTime() > now.getTime())
+      ) {
+        return p;
+      }
+    }
+    return null;
+  },
+
+  async getUserSeriesPurchases(userId: string): Promise<ISeriesPurchase[]> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    if (isMongo) {
+      const docs = await SeriesPurchaseModel.find({ userId }).sort({ purchasedAt: -1 }).lean();
+      return docs.map((doc: any) => ({
+        id: doc._id?.toString(),
+        userId: doc.userId,
+        seriesId: doc.seriesId,
+        accessType: doc.accessType,
+        amount: doc.amount,
+        currency: doc.currency,
+        paymentId: doc.paymentId,
+        orderNumber: doc.orderNumber,
+        status: doc.status,
+        purchasedAt: doc.purchasedAt,
+        expiresAt: doc.expiresAt
+      }));
+    }
+
+    return Array.from(memDb.seriesPurchases.values())
+      .filter((p) => p.userId === userId)
+      .sort((a, b) => new Date(b.purchasedAt).getTime() - new Date(a.purchasedAt).getTime());
+  },
+
+  async recordSeriesPurchase(data: Omit<ISeriesPurchase, 'id'>): Promise<ISeriesPurchase> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    if (isMongo) {
+      const doc = await SeriesPurchaseModel.findOneAndUpdate(
+        { orderNumber: data.orderNumber },
+        { $set: data },
+        { upsert: true, new: true }
+      ).lean();
+      return {
+        id: (doc as any)?._id?.toString(),
+        ...data
+      };
+    }
+
+    const id = `sp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const item: ISeriesPurchase = { ...data, id };
+    memDb.seriesPurchases.set(data.orderNumber, item);
+    return item;
+  },
+
+  // -------------------------------------------------------------
+  // User Playback Progress (Episodes & Movies)
+  // -------------------------------------------------------------
+  async saveUserPlaybackProgress(
+    data: Omit<IUserPlaybackProgress, 'id' | 'lastWatchedAt'>
+  ): Promise<IUserPlaybackProgress> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    const epNum = Math.max(1, Math.floor(Number(data.episodeNumber) || 1));
+    const currentTime = Math.max(0, Number(data.currentTime ?? data.playbackPosition) || 0);
+    const duration = Math.max(0, Number(data.duration) || 0);
+    const completed =
+      data.completed !== undefined
+        ? Boolean(data.completed)
+        : duration > 0 && currentTime / duration >= 0.9;
+    const now = new Date();
+
+    const payload: IUserPlaybackProgress = {
+      userId: data.userId,
+      movieId: data.movieId,
+      episodeNumber: epNum,
+      currentTime,
+      playbackPosition: currentTime,
+      duration,
+      completed,
+      lastWatchedAt: now
+    };
+
+    if (isMongo) {
+      const doc = await UserPlaybackProgressModel.findOneAndUpdate(
+        { userId: data.userId, movieId: data.movieId, episodeNumber: epNum },
+        { $set: payload },
+        { upsert: true, new: true }
+      ).lean();
+      return {
+        ...payload,
+        id: (doc as any)?._id?.toString()
+      };
+    }
+
+    const key = `${data.userId}:${data.movieId}:${epNum}`;
+    const item: IUserPlaybackProgress = { ...payload, id: key };
+    memDb.playbackProgress.set(key, item);
+    return item;
+  },
+
+  async getUserPlaybackProgress(userId: string, movieId?: string): Promise<IUserPlaybackProgress[]> {
+    const isMongo = await connectDB();
+    requireMongoInProduction(isMongo);
+
+    if (isMongo) {
+      const filter: any = { userId };
+      if (movieId) filter.movieId = movieId;
+      const docs = await UserPlaybackProgressModel.find(filter).sort({ lastWatchedAt: -1 }).lean();
+      return docs.map((d: any) => ({
+        id: d._id?.toString(),
+        userId: d.userId,
+        movieId: d.movieId,
+        episodeNumber: Number(d.episodeNumber || 1),
+        currentTime: Number(d.currentTime ?? d.playbackPosition ?? 0),
+        playbackPosition: Number(d.playbackPosition ?? d.currentTime ?? 0),
+        duration: Number(d.duration || 0),
+        completed: Boolean(d.completed),
+        lastWatchedAt: d.lastWatchedAt ? new Date(d.lastWatchedAt) : new Date()
+      }));
+    }
+
+    let list = Array.from(memDb.playbackProgress.values()).filter((p) => p.userId === userId);
+    if (movieId) list = list.filter((p) => p.movieId === movieId);
+    return list.sort((a, b) => new Date(b.lastWatchedAt).getTime() - new Date(a.lastWatchedAt).getTime());
+  },
+
+  async seedFeaturedSeriesIfMissing(): Promise<void> {
+    const isMongo = await connectDB();
+    if (!isMongo) return;
+
+    // 1. Repair any existing movies in MongoDB that have missing or broken poster URLs
+    const allDocs = await MovieModel.find({}).lean();
+    for (const doc of allDocs) {
+      const rawPoster = String((doc as any).posterUrl || '').trim();
+      const titleMn = String((doc as any).titleMn || (doc as any)?.title?.mn || '');
+      const isKnownBrokenTitle = /Ирээдүйн өөрөөсөө/i.test(titleMn);
+      const needsRepair =
+        !isValidPosterUrl(rawPoster) ||
+        (isKnownBrokenTitle && !rawPoster.startsWith('/src/assets/images/'));
+
+      if (needsRepair) {
+        const fixedPoster = isKnownBrokenTitle
+          ? '/src/assets/images/hero_singularity_core_1794122760127.jpg'
+          : resolveSafePosterUrl(rawPoster, String((doc as any).id || (doc as any)._id || 'movie'));
+        await MovieModel.updateOne(
+          { _id: (doc as any)._id },
+          {
+            $set: {
+              posterUrl: fixedPoster,
+              backdropUrl: resolveSafePosterUrl((doc as any).backdropUrl, fixedPoster),
+              bannerUrl: resolveSafePosterUrl((doc as any).bannerUrl, fixedPoster)
+            }
+          }
+        );
+      }
+    }
+
+    // 2. Ensure core catalog movies (featured series, Originals, and 18+ Hot+ sample) exist in MongoDB
+    for (const m of MOVIES) {
+      const existing = await MovieModel.findOne({
+        $or: [{ id: m.id }, { slug: m.id }]
+      }).lean();
+
+      if (!existing) {
+        await this.createMovie({
+          id: m.id,
+          slug: m.id,
+          titleMn: m.titleMn,
+          titleEn: m.titleEn,
+          originalTitle: m.originalTitle || m.titleEn,
+          synopsisMn: m.descriptionMn,
+          synopsisEn: m.descriptionEn,
+          posterUrl: m.posterUrl,
+          backdropUrl: m.bannerUrl || m.posterUrl,
+          videoUrl: m.videoSource,
+          trailerUrl: m.trailerUrl,
+          year: m.year,
+          duration: m.duration,
+          genres: m.genres || [m.genreMn || 'AI Sci-Fi'],
+          rating: m.rating,
+          ageRating: m.ageRating || '13+',
+          quality: m.quality,
+          directorMn: m.directorMn,
+          directorEn: m.directorEn,
+          castMn: m.castMn,
+          castEn: m.castEn,
+          language: 'mn',
+          country: m.country || 'Монгол',
+          type: m.type || 'movie',
+          featured: Boolean(m.featured),
+          trending: Boolean(m.trending),
+          isPremium: m.isPremium !== false,
+          minPlan: m.minPlan || 'basic',
+          published: true,
+          hasMongolianSubtitles: m.hasMongolianSubtitles !== false,
+          isOriginal: Boolean(m.isOriginal),
+          isExclusive: Boolean(m.isExclusive),
+          isShortDrama: Boolean(m.isShortDrama),
+          totalEpisodes: m.totalEpisodes || (m.type === 'series' ? 50 : 1),
+          freeEpisodes: m.freeEpisodes ?? (m.type === 'series' ? 6 : 0),
+          unlockPrice: m.unlockPrice || 4900,
+          rentalDurationHours: m.rentalDurationHours || 72,
+          vipEnabled: m.vipEnabled !== false,
+          seriesStatus: m.seriesStatus || 'completed',
+          tags: m.tags
+        });
+      } else if (m.type === 'series') {
+        const normalized = normalizeMovieDoc(existing);
+        const eps = await EpisodeModel.countDocuments({ seriesId: normalized.id });
+        if (eps === 0) {
+          await this.ensureSeriesEpisodes(normalized);
+        }
+      }
+    }
   }
 };
+
+export const Storage: typeof rawStorage = new Proxy(rawStorage, {
+  get(target, prop, receiver) {
+    const value = Reflect.get(target, prop, receiver);
+    if (typeof value !== 'function') return value;
+    return async function (...args: any[]) {
+      try {
+        await ensureDatabaseConnection();
+        return await value.apply(target, args);
+      } catch (err) {
+        throw normalizeStorageError(err);
+      }
+    };
+  }
+});
+

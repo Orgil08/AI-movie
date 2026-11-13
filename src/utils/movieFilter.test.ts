@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { filterMovies, extractGenres } from './movieFilter.js';
+import {
+  filterMovies,
+  extractGenres,
+  getMovieTitleSuggestions,
+  splitHighlightText
+} from './movieFilter.js';
 import { Movie } from '../data/movies.js';
 
 const mockMovies: Movie[] = [
@@ -112,4 +117,32 @@ describe('MovieFilter - Real-time Search and Filtering', () => {
     assert.ok(genres.includes('all'));
     assert.ok(genres.includes('Киберпанк'));
   });
+
+  it('getMovieTitleSuggestions returns ranked movie title matches and respects limit', () => {
+    const emptyRes = getMovieTitleSuggestions(mockMovies, '   ');
+    assert.strictEqual(emptyRes.length, 0);
+
+    const nomadSuggestions = getMovieTitleSuggestions(mockMovies, 'Nomad');
+    assert.strictEqual(nomadSuggestions.length, 1);
+    assert.strictEqual(nomadSuggestions[0].id, 'm1');
+
+    const mnSuggestions = getMovieTitleSuggestions(mockMovies, 'Сингулярит');
+    assert.strictEqual(mnSuggestions.length, 1);
+    assert.strictEqual(mnSuggestions[0].id, 'm2');
+
+    const limitedSuggestions = getMovieTitleSuggestions(mockMovies, '20', 1);
+    assert.strictEqual(limitedSuggestions.length, 1);
+  });
+
+  it('splitHighlightText splits matching query segments case-insensitively and handles regex special chars', () => {
+    const segments = splitHighlightText('Nomad 2099: The Golden Horde', '2099');
+    assert.strictEqual(segments.length, 3);
+    assert.deepStrictEqual(segments[0], { text: 'Nomad ', match: false });
+    assert.deepStrictEqual(segments[1], { text: '2099', match: true });
+    assert.deepStrictEqual(segments[2], { text: ': The Golden Horde', match: false });
+
+    const specialSegments = splitHighlightText('Nomad (2099) [4K+]', '(2099)');
+    assert.ok(specialSegments.some((s) => s.match && s.text === '(2099)'));
+  });
 });
+

@@ -33,11 +33,13 @@
 
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
-import { UserModel, AuditLogModel } from '../src/db/models.js';
-import { Storage, connectDB, isMongoActive } from '../src/db/storage.js';
+import { UserModel } from '../src/db/models.js';
+import { Storage, connectDB, isMemoryFallbackPermitted } from '../src/db/storage.js';
 
-// Load environment variables from .env
-dotenv.config();
+// Load environment variables from .env when running outside isolated unit tests
+if (!process.env.NODE_TEST_CONTEXT) {
+  dotenv.config();
+}
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -45,6 +47,10 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * Connect to MongoDB instance defined in .env using Mongoose.
  */
 async function connectMongoose(): Promise<boolean> {
+  if (isMemoryFallbackPermitted()) {
+    return false;
+  }
+
   const uri = process.env.MONGODB_URI;
 
   if (uri && uri.trim() !== '' && !uri.includes('<') && !uri.includes('>')) {
@@ -66,7 +72,7 @@ async function connectMongoose(): Promise<boolean> {
     console.log(`[promote-admin] MONGODB_URI not set or contains placeholders in .env; checking internal storage...`);
   }
 
-  // Graceful fallback to app's storage helper if needed
+  // Delegate to app's storage connection handler (throws 503 if unavailable)
   return await connectDB();
 }
 

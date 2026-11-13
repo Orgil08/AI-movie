@@ -4,13 +4,31 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { Storage, connectDB } from './src/db/storage.js';
+import {
+  Storage,
+  connectDB,
+  DatabaseConnectionError,
+  enableStrictMongoMode,
+  ensureDatabaseConnection,
+  getDatabaseStatus,
+  isMongoActive,
+  isMongoUriConfigured,
+  isProductionEnvironment,
+  normalizeStorageError
+} from './src/db/storage.js';
 import { defaultWireService, WireService } from './src/services/wire.service.js';
 import { SUBSCRIPTION_PLANS, isValidPlanId, getPlanById } from './src/config/subscription-plans.js';
 import { BANK_TRANSFER_DETAILS } from './src/config/bank-details.js';
 import { hashPassword, verifyPassword } from './src/utils/crypto.js';
 import { createSignedSessionToken, safeStringEqual, verifySignedSessionToken } from './src/utils/session.js';
 import { checkMovieAccess } from './src/utils/accessControl.js';
+import { getMovieTitleSuggestions } from './src/utils/movieFilter.js';
+import { validateEpisodesPayload, canAccessEpisode } from './src/utils/seriesEpisodes.js';
+import {
+  isAdultRestrictedMovie,
+  filterMoviesForAgeGate,
+  resolveSafePosterUrl
+} from './src/utils/ageGateAndPosters.js';
 import { getPageMetadata } from './src/i18n/seo.js';
 import { getLocaleFromPath } from './src/i18n/routing.js';
 import {
@@ -23,15 +41,48 @@ import {
 } from './src/utils/validation.js';
 
 dotenv.config();
+// Enforce strict MongoDB mode on the Express server: never fall back to memory storage
+enableStrictMongoMode(true);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = isProductionEnvironment();
 const SESSION_COOKIE = 'ai_movie_uid';
 const CSRF_COOKIE = 'ai_movie_csrf';
+const AGE_VERIFIED_COOKIE = 'ai_movie_age_verified';
+
+export function sendApiError(
+  res: Response,
+  rawErr: any,
+  fallbackCode = 'SERVER_ERROR',
+  fallbackMessage = 'Сервер дээр алдаа гарлаа.',
+  defaultStatus = 500
+): Response {
+  const err: any = normalizeStorageError(rawErr);
+  if (
+    err instanceof DatabaseConnectionError ||
+    err?.statusCode === 503 ||
+    err?.code === 'DATABASE_UNAVAILABLE' ||
+    err?.code === 'DATABASE_NOT_CONFIGURED'
+  ) {
+    return res.status(503).json({
+      error: err.code || 'DATABASE_UNAVAILABLE',
+      message:
+        err.message ||
+        'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).',
+      database: getDatabaseStatus()
+    });
+  }
+
+  const status = typeof err?.statusCode === 'number' ? err.statusCode : defaultStatus;
+  return res.status(status).json({
+    error: err?.code || fallbackCode,
+    message: err?.message || fallbackMessage
+  });
+}
 
 function getAuthSecret(): string {
   const secret = process.env.AUTH_SECRET?.trim();
@@ -40,7 +91,7 @@ function getAuthSecret(): string {
       ? secret
       : crypto.createHash('sha256').update(secret).digest('hex');
   }
-  if (isProduction) {
+  if (isProductionEnvironment()) {
     throw new Error('AUTH_SECRET must be configured in production.');
   }
   return 'local-development-only-ai-movie-session-secret';
@@ -83,13 +134,56 @@ function verifySessionToken(token: string | null) {
   return verifySignedSessionToken(token, getAuthSecret());
 }
 
-function setSessionCookie(res: Response, userId: string, maxAgeSeconds: number): void {
+function setSessionCookie(res: Response, userId: string, maxAgeSeconds: number): string {
   const { token } = createSessionToken(userId, maxAgeSeconds);
   const secure = isProduction ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
     `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`
   );
+  return token;
+}
+
+function extractRequestSessionToken(req: Request): string | null {
+  const cookieToken = readCookie(req, SESSION_COOKIE);
+  if (cookieToken && verifySessionToken(cookieToken)) {
+    return cookieToken;
+  }
+
+  const authHeader = req.get('authorization') || '';
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    const bearerToken = authHeader.slice(7).trim();
+    if (bearerToken && verifySessionToken(bearerToken)) {
+      return bearerToken;
+    }
+  }
+
+  const headerToken = (req.get('x-session-token') || '').trim();
+  if (headerToken && verifySessionToken(headerToken)) {
+    return headerToken;
+  }
+
+  return cookieToken || null;
+}
+
+function isRequestAgeVerified(req: Request): boolean {
+  const cookieToken = readCookie(req, AGE_VERIFIED_COOKIE);
+  if (cookieToken) {
+    const claims = verifySessionToken(cookieToken);
+    if (claims && claims.userId === 'age_verified_18plus') {
+      return true;
+    }
+  }
+
+  const headerToken = (req.get('x-age-verified-token') || '').trim();
+  if (headerToken) {
+    const claims = verifySessionToken(headerToken);
+    if (claims && claims.userId === 'age_verified_18plus') {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function requireCsrf(req: Request, res: Response, next: NextFunction): void {
@@ -125,11 +219,11 @@ export interface AuthenticatedUser {
   status: 'active' | 'suspended';
 }
 
-// User resolution uses a signed, expiring HttpOnly cookie. A client-supplied
-// user ID header is never accepted as proof of authentication.
+// User resolution uses a signed, expiring session token (from HttpOnly cookie or signed Bearer token).
+// A plain client-supplied user ID header is never accepted as proof of authentication.
 async function getAuthenticatedUser(req: Request): Promise<AuthenticatedUser | null> {
-  const claims = verifySessionToken(readCookie(req, SESSION_COOKIE));
-  if (!claims) return null;
+  const claims = verifySessionToken(extractRequestSessionToken(req));
+  if (!claims || claims.userId === 'csrf') return null;
 
   const dbUser = await Storage.getUserById(claims.userId);
   if (!dbUser || dbUser.status === 'suspended') return null;
@@ -156,8 +250,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
     (req as any).user = user;
     next();
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Баталгаажуулалтын алдаа гарлаа.');
   }
 }
 
@@ -177,8 +270,7 @@ async function requireAdmin(req: Request, res: Response, next: NextFunction) {
     (req as any).user = user;
     next();
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Баталгаажуулалтын алдаа гарлаа.');
   }
 }
 
@@ -207,41 +299,65 @@ function getBaseUrl(req: Request): string {
   return `${protocol}://${host}`;
 }
 
-// Fail closed on Vercel/production: never silently authenticate against or read from the
-// seeded in-memory development database when MongoDB is unavailable.
-app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
-  if (!isProduction) return next();
+const STATELESS_API_PATHS = new Set([
+  '/health',
+  '/auth/csrf',
+  '/auth/providers',
+  '/auth/logout',
+  '/bank-details',
+  '/age-verification/status',
+  '/age-verification/confirm',
+  '/age-verification/revoke'
+]);
 
-  // Stateless utility endpoints do not require an active MongoDB connection
-  if (req.path === '/health' || req.path === '/auth/csrf' || req.path === '/auth/providers' || req.path === '/bank-details') {
-    if (!process.env.AUTH_SECRET?.trim() && req.path === '/auth/csrf') {
-      return res.status(503).json({ error: 'AUTH_SECRET_NOT_CONFIGURED', message: 'Production AUTH_SECRET is not configured in Vercel.' });
+// Fail closed across all database-backed API endpoints:
+// check MongoDB connection status and return HTTP 503 if unavailable instead of using memory-based fallbacks.
+app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
+  if (STATELESS_API_PATHS.has(req.path)) {
+    if (isProductionEnvironment() && !process.env.AUTH_SECRET?.trim() && req.path === '/auth/csrf') {
+      return res.status(503).json({
+        error: 'AUTH_SECRET_NOT_CONFIGURED',
+        message: 'Production AUTH_SECRET is not configured in Vercel.'
+      });
     }
     return next();
   }
 
-  if (!process.env.MONGODB_URI || process.env.MONGODB_URI.includes('<') || process.env.MONGODB_URI.includes('>')) {
-    return res.status(503).json({ error: 'DATABASE_NOT_CONFIGURED', message: 'Production MongoDB connection (MONGODB_URI) is not configured in Vercel.' });
+  if (!isMongoUriConfigured()) {
+    return res.status(503).json({
+      error: 'DATABASE_NOT_CONFIGURED',
+      message: 'Өгөгдлийн сангийн тохиргоо (MONGODB_URI) хийгдээгүй байна.',
+      database: getDatabaseStatus()
+    });
   }
-  if (!process.env.AUTH_SECRET?.trim()) {
-    return res.status(503).json({ error: 'AUTH_SECRET_NOT_CONFIGURED', message: 'Production authentication secret (AUTH_SECRET) is not configured in Vercel.' });
+
+  if (isProductionEnvironment() && !process.env.AUTH_SECRET?.trim()) {
+    return res.status(503).json({
+      error: 'AUTH_SECRET_NOT_CONFIGURED',
+      message: 'Production authentication secret (AUTH_SECRET) is not configured in Vercel.'
+    });
   }
 
   try {
-    const connected = await connectDB();
-    if (!connected) {
+    const connected = await ensureDatabaseConnection();
+    if (!connected || !isMongoActive()) {
       return res.status(503).json({
         error: 'DATABASE_UNAVAILABLE',
-        message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).'
+        message:
+          'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).',
+        database: getDatabaseStatus()
       });
     }
     return next();
   } catch (error) {
-    console.error('[API] Production database initialization failed:', error);
-    return res.status(503).json({
-      error: 'DATABASE_UNAVAILABLE',
-      message: 'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).'
-    });
+    console.error('[API] Database connection check failed:', error);
+    return sendApiError(
+      res,
+      error,
+      'DATABASE_UNAVAILABLE',
+      'Өгөгдлийн сантай холбогдож чадсангүй (MongoDB Atlas Network Access 0.0.0.0/0 болон MONGODB_URI шалгана уу).',
+      503
+    );
   }
 });
 
@@ -290,7 +406,7 @@ app.get('/api/auth/csrf', (_req: Request, res: Response) => {
 
 app.get('/api/auth/session', async (req: Request, res: Response) => {
   try {
-    const claims = verifySessionToken(readCookie(req, SESSION_COOKIE));
+    const claims = verifySessionToken(extractRequestSessionToken(req));
     const user = claims ? await getAuthenticatedUser(req) : null;
     const subscription = user ? await Storage.getActiveSubscription(user.id) : null;
     res.setHeader('Cache-Control', 'no-store');
@@ -301,7 +417,7 @@ app.get('/api/auth/session', async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('[Auth/Session] Error:', error);
-    return res.status(500).json({ error: 'SESSION_LOOKUP_FAILED', message: 'Session шалгахад алдаа гарлаа.' });
+    return sendApiError(res, error, 'SESSION_LOOKUP_FAILED', 'Session шалгахад алдаа гарлаа.', 500);
   }
 });
 
@@ -339,8 +455,7 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
       wireConfigured: defaultWireService.isConfigured()
     });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Хэрэглэгчийн мэдээлэл шалгахад алдаа гарлаа.');
   }
 });
 
@@ -392,11 +507,12 @@ app.post('/api/auth/register', requireCsrf, async (req: Request, res: Response) 
       role: 'user'
     });
 
-    setSessionCookie(res, newUser.id!, 30 * 24 * 60 * 60);
+    const sessionToken = setSessionCookie(res, newUser.id!, 30 * 24 * 60 * 60);
 
     return res.status(201).json({
       success: true,
       message: 'Амжилттай бүртгэгдлээ.',
+      sessionToken,
       user: {
         id: newUser.id,
         name: newUser.name,
@@ -406,8 +522,7 @@ app.post('/api/auth/register', requireCsrf, async (req: Request, res: Response) 
     });
   } catch (err: any) {
     console.error('[Auth/Register] Error:', err);
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message || 'Бүртгүүлэхэд алдаа гарлаа.' });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Бүртгүүлэхэд алдаа гарлаа.');
   }
 });
 
@@ -456,14 +571,15 @@ app.post('/api/auth/login', requireCsrf, async (req: Request, res: Response) => 
 
     await Storage.updateUser(user.id!, { lastLoginAt: new Date() });
 
-    const maxAge = remember ? 30 * 24 * 60 * 60 : 24 * 60 * 60;
-    setSessionCookie(res, user.id!, maxAge);
+    const maxAge = remember !== false ? 30 * 24 * 60 * 60 : 7 * 24 * 60 * 60;
+    const sessionToken = setSessionCookie(res, user.id!, maxAge);
 
     const subscription = await Storage.getActiveSubscription(user.id!);
 
     return res.json({
       success: true,
       message: 'Амжилттай нэвтэрлээ.',
+      sessionToken,
       user: {
         id: user.id,
         name: user.name,
@@ -474,8 +590,7 @@ app.post('/api/auth/login', requireCsrf, async (req: Request, res: Response) => 
     });
   } catch (err: any) {
     console.error('[Auth/Login] Error:', err);
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message || 'Нэвтрэхэд алдаа гарлаа.' });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Нэвтрэхэд алдаа гарлаа.');
   }
 });
 
@@ -560,11 +675,7 @@ app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error('[Auth/ForgotPassword] Error:', err);
-    const status = err?.statusCode || 500;
-    return res.status(status).json({
-      error: err?.code || 'SERVER_ERROR',
-      message: err.message || 'Нууц үг сэргээх хүсэлт илгээхэд алдаа гарлаа.'
-    });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Нууц үг сэргээх хүсэлт илгээхэд алдаа гарлаа.');
   }
 });
 
@@ -585,8 +696,7 @@ app.get('/api/auth/verify-reset-token', async (req: Request, res: Response) => {
       email: verification.email
     });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ valid: false, error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Токен шалгахад алдаа гарлаа.');
   }
 });
 
@@ -631,8 +741,7 @@ app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
       message: result.message
     });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Нууц үг шинэчлэхэд алдаа гарлаа.');
   }
 });
 
@@ -660,7 +769,7 @@ app.post('/api/auth/update-profile', requireAuth, async (req: Request, res: Resp
       }
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Мэдээлэл шинэчлэхэд алдаа гарлаа.');
   }
 });
 
@@ -693,7 +802,7 @@ app.post('/api/auth/change-password', requireAuth, async (req: Request, res: Res
       message: 'Нууц үг амжилттай шинэчлэгдлээ.'
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Нууц үг солиход алдаа гарлаа.');
   }
 });
 
@@ -724,7 +833,7 @@ app.post('/api/auth/switch-user', (req: Request, res: Response) => {
     })
     .catch((error) => {
       console.error('[Auth/SwitchUser] Error:', error);
-      return res.status(500).json({ error: 'SERVER_ERROR', message: 'Хэрэглэгч солиход алдаа гарлаа.' });
+      return sendApiError(res, error, 'SERVER_ERROR', 'Хэрэглэгч солиход алдаа гарлаа.');
     });
 });
 
@@ -736,8 +845,7 @@ app.get('/api/settings', async (_req: Request, res: Response) => {
     const settings = await Storage.getWebsiteSettings();
     res.json({ success: true, settings });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Тохиргоо ачаалахад алдаа гарлаа.');
   }
 });
 
@@ -746,8 +854,7 @@ app.get('/api/categories', async (_req: Request, res: Response) => {
     const categories = await Storage.getAllCategories();
     res.json({ success: true, categories });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Ангилал ачаалахад алдаа гарлаа.');
   }
 });
 
@@ -762,7 +869,7 @@ app.get('/api/admin/stats', requireAdmin, async (_req: Request, res: Response) =
     res.json({ success: true, stats });
   } catch (err: any) {
     console.error('[Admin/Stats] Error:', err);
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Статистик ачаалахад алдаа гарлаа.');
   }
 });
 
@@ -774,7 +881,7 @@ app.get('/api/admin/movies', requireAdmin, async (req: Request, res: Response) =
     const movies = await Storage.getAllMovies({ search, genre, publishedOnly: false });
     res.json({ success: true, movies });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Кино жагсаалт ачаалахад алдаа гарлаа.');
   }
 });
 
@@ -808,8 +915,7 @@ app.post('/api/admin/movies', requireAdmin, async (req: Request, res: Response) 
     res.status(201).json({ success: true, movie, message: 'Кино амжилттай нэмэгдлээ.' });
   } catch (err: any) {
     console.error('[Admin/CreateMovie] Error:', err);
-    const status = err?.code === 'DUPLICATE_SLUG' ? 409 : err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Кино нэмэхэд алдаа гарлаа.', err?.code === 'DUPLICATE_SLUG' ? 409 : 500);
   }
 });
 
@@ -854,11 +960,41 @@ app.put('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Respons
       castMn: req.body?.castMn ?? req.body?.cast?.mn ?? existing.castMn ?? '',
       castEn: req.body?.castEn ?? req.body?.cast?.en ?? existing.castEn ?? '',
       language: req.body?.language ?? existing.language ?? 'mn',
+      country: req.body?.country ?? existing.country ?? 'Монгол',
+      originalTitle: req.body?.originalTitle ?? existing.originalTitle ?? existing.titleEn,
       type: req.body?.type ?? existing.type ?? 'movie',
       featured: req.body?.featured !== undefined ? Boolean(req.body.featured) : existing.featured,
+      trending: req.body?.trending !== undefined ? Boolean(req.body.trending) : existing.trending,
       isPremium: req.body?.isPremium !== undefined ? Boolean(req.body.isPremium) : existing.isPremium,
       minPlan: req.body?.minPlan ?? existing.minPlan ?? 'basic',
-      published: req.body?.published !== undefined ? Boolean(req.body.published) : existing.published
+      published: req.body?.published !== undefined ? Boolean(req.body.published) : existing.published,
+      hasMongolianSubtitles:
+        req.body?.hasMongolianSubtitles !== undefined
+          ? Boolean(req.body.hasMongolianSubtitles)
+          : existing.hasMongolianSubtitles !== false,
+      isOriginal:
+        req.body?.isOriginal !== undefined ? Boolean(req.body.isOriginal) : Boolean(existing.isOriginal),
+      isExclusive:
+        req.body?.isExclusive !== undefined ? Boolean(req.body.isExclusive) : Boolean(existing.isExclusive),
+      isShortDrama:
+        req.body?.isShortDrama !== undefined ? Boolean(req.body.isShortDrama) : Boolean(existing.isShortDrama),
+      totalEpisodes:
+        req.body?.totalEpisodes !== undefined
+          ? Number(req.body.totalEpisodes)
+          : (existing.totalEpisodes ?? (existing.type === 'series' ? 50 : 1)),
+      freeEpisodes:
+        req.body?.freeEpisodes !== undefined
+          ? Number(req.body.freeEpisodes)
+          : (existing.freeEpisodes ?? (existing.type === 'series' ? 6 : 0)),
+      unlockPrice:
+        req.body?.unlockPrice !== undefined ? Number(req.body.unlockPrice) : (existing.unlockPrice ?? 4900),
+      rentalDurationHours:
+        req.body?.rentalDurationHours !== undefined
+          ? Number(req.body.rentalDurationHours)
+          : (existing.rentalDurationHours ?? 72),
+      vipEnabled:
+        req.body?.vipEnabled !== undefined ? Boolean(req.body.vipEnabled) : existing.vipEnabled !== false,
+      seriesStatus: req.body?.seriesStatus ?? existing.seriesStatus ?? 'completed'
     };
 
     const parseResult = movieSchema.safeParse(candidate);
@@ -884,8 +1020,7 @@ app.put('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Respons
 
     res.json({ success: true, movie, message: 'Киноны мэдээлэл амжилттай шинэчлэгдлээ.' });
   } catch (err: any) {
-    const status = err?.code === 'DUPLICATE_SLUG' ? 409 : err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Кино шинэчлэхэд алдаа гарлаа.', err?.code === 'DUPLICATE_SLUG' ? 409 : 500);
   }
 });
 
@@ -910,7 +1045,7 @@ app.delete('/api/admin/movies/:id', requireAdmin, async (req: Request, res: Resp
 
     res.json({ success: true, message: 'Кино амжилттай устгагдлаа.' });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Кино устгахад алдаа гарлаа.');
   }
 });
 
@@ -936,7 +1071,7 @@ app.patch('/api/admin/movies/:id/toggle-publish', requireAdmin, async (req: Requ
       message: updated?.published ? 'Кино нийтлэгдлээ.' : 'Кино ноорог төлөвт шилжлээ.'
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -962,7 +1097,146 @@ app.patch('/api/admin/movies/:id/toggle-featured', requireAdmin, async (req: Req
       message: updated?.featured ? 'Онцлох киногоор сонгогдлоо.' : 'Онцлох төлөв цуцлагдлаа.'
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
+  }
+});
+
+// 7b. TV Series & Episode Management Endpoints (Admin)
+app.get('/api/admin/movies/:id/episodes', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    if (!movie) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Цуврал олдсонгүй.' });
+    }
+    const episodes = await Storage.getEpisodesBySeriesId(movie.id, false);
+    res.json({ success: true, movie, episodes });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Ангиудын жагсаалт ачаалахад алдаа гарлаа.');
+  }
+});
+
+app.post('/api/admin/movies/:id/episodes', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    if (!movie) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Цуврал олдсонгүй.' });
+    }
+
+    const epNum = Math.max(1, Math.floor(Number(req.body?.episodeNumber) || 1));
+    const videoUrl = String(req.body?.videoUrl || movie.videoUrl || '').trim();
+    if (!videoUrl || (!videoUrl.startsWith('http://') && !videoUrl.startsWith('https://') && !videoUrl.startsWith('/'))) {
+      return res.status(400).json({
+        error: 'INVALID_VIDEO_URL',
+        message: `${epNum}-р ангийн видео холбоос (R2 MP4 URL) зөв оруулна уу.`
+      });
+    }
+
+    const episode = await Storage.upsertEpisode(movie.id, {
+      ...req.body,
+      episodeNumber: epNum,
+      videoUrl
+    });
+
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'UPSERT_EPISODE',
+      target: `${movie.id}#ep${epNum}`,
+      details: `Saved episode ${epNum} for "${movie.titleMn}"`
+    });
+
+    res.json({ success: true, episode, message: `${epNum}-р анги амжилттай хадгалагдлаа.` });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Анги хадгалахад алдаа гарлаа.');
+  }
+});
+
+app.put('/api/admin/movies/:id/episodes/bulk', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    if (!movie) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Цуврал олдсонгүй.' });
+    }
+
+    const rawEpisodes = Array.isArray(req.body?.episodes) ? req.body.episodes : [];
+    const totalEpisodes = Number(req.body?.totalEpisodes ?? movie.totalEpisodes ?? rawEpisodes.length);
+    const freeEpisodes =
+      req.body?.freeEpisodes !== undefined ? Number(req.body.freeEpisodes) : (movie.freeEpisodes ?? 6);
+
+    const validation = validateEpisodesPayload(rawEpisodes);
+    if (!validation.valid) {
+      return res.status(400).json({
+        error: 'EPISODE_VALIDATION_ERROR',
+        message: validation.error || 'Ангийн мэдээлэл буруу байна.'
+      });
+    }
+
+    // Update series config if passed alongside bulk episodes
+    if (
+      req.body?.totalEpisodes !== undefined ||
+      req.body?.freeEpisodes !== undefined ||
+      req.body?.unlockPrice !== undefined ||
+      req.body?.rentalDurationHours !== undefined ||
+      req.body?.seriesStatus !== undefined
+    ) {
+      await Storage.updateMovie(movie.id, {
+        type: 'series',
+        totalEpisodes: Math.max(1, totalEpisodes),
+        freeEpisodes: Math.max(0, freeEpisodes),
+        unlockPrice:
+          req.body?.unlockPrice !== undefined ? Number(req.body.unlockPrice) : (movie.unlockPrice ?? 4900),
+        rentalDurationHours:
+          req.body?.rentalDurationHours !== undefined
+            ? Number(req.body.rentalDurationHours)
+            : (movie.rentalDurationHours ?? 72),
+        seriesStatus: req.body?.seriesStatus || movie.seriesStatus || 'completed'
+      });
+    }
+
+    const savedEpisodes = await Storage.bulkSaveEpisodes(movie.id, rawEpisodes, freeEpisodes);
+
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'BULK_SAVE_EPISODES',
+      target: movie.id,
+      details: `Bulk saved ${savedEpisodes.length} episodes for "${movie.titleMn}" (free=${freeEpisodes})`
+    });
+
+    res.json({
+      success: true,
+      episodes: savedEpisodes,
+      message: `Нийт ${savedEpisodes.length} ангийн мэдээлэл амжилттай хадгалагдлаа.`
+    });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Ангиудыг бөөнөөр хадгалахад алдаа гарлаа.');
+  }
+});
+
+app.delete('/api/admin/movies/:id/episodes/:episodeId', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const admin = (req as any).user as AuthenticatedUser;
+    const { id, episodeId } = req.params;
+    const deleted = await Storage.deleteEpisode(id, episodeId);
+    if (!deleted) {
+      return res.status(404).json({ error: 'EPISODE_NOT_FOUND', message: 'Анги олдсонгүй.' });
+    }
+
+    await Storage.recordAuditLog({
+      adminId: admin.id,
+      adminEmail: admin.email,
+      action: 'DELETE_EPISODE',
+      target: `${id}#${episodeId}`
+    });
+
+    res.json({ success: true, message: 'Анги устгагдлаа.' });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Анги устгахад алдаа гарлаа.');
   }
 });
 
@@ -972,7 +1246,7 @@ app.get('/api/admin/categories', requireAdmin, async (_req: Request, res: Respon
     const categories = await Storage.getAllCategories();
     res.json({ success: true, categories });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -999,7 +1273,7 @@ app.post('/api/admin/categories', requireAdmin, async (req: Request, res: Respon
 
     res.status(201).json({ success: true, category: cat, message: 'Ангилал амжилттай үүслээ.' });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1021,7 +1295,7 @@ app.put('/api/admin/categories/:id', requireAdmin, async (req: Request, res: Res
 
     res.json({ success: true, category: cat, message: 'Ангилал шинэчлэгдлээ.' });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1040,7 +1314,7 @@ app.delete('/api/admin/categories/:id', requireAdmin, async (req: Request, res: 
 
     res.json({ success: true, message: 'Ангилал устгагдлаа.' });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1073,7 +1347,7 @@ app.get('/api/admin/users', requireAdmin, async (_req: Request, res: Response) =
 
     res.json({ success: true, users: sanitized });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1109,7 +1383,7 @@ app.patch('/api/admin/users/:id/role', requireAdmin, async (req: Request, res: R
       message: 'Хэрэглэгчийн эрх амжилттай өөрчлөгдлөө.'
     });
   } catch (err: any) {
-    res.status(400).json({ error: 'ROLE_UPDATE_FAILED', message: err.message });
+    return sendApiError(res, err, 'ROLE_UPDATE_FAILED', err?.message || 'Эрх өөрчлөхөд алдаа гарлаа.', 400);
   }
 });
 
@@ -1145,7 +1419,7 @@ app.patch('/api/admin/users/:id/status', requireAdmin, async (req: Request, res:
       message: 'Хэрэглэгчийн төлөв амжилттай шинэчлэгдлээ.'
     });
   } catch (err: any) {
-    res.status(400).json({ error: 'STATUS_UPDATE_FAILED', message: err.message });
+    return sendApiError(res, err, 'STATUS_UPDATE_FAILED', err?.message || 'Төлөв өөрчлөхөд алдаа гарлаа.', 400);
   }
 });
 
@@ -1169,18 +1443,27 @@ app.get('/api/admin/payments', requireAdmin, async (_req: Request, res: Response
 
     res.json({ success: true, payments: enriched });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
-// Approve a pending bank transfer payment (Admin only)
-app.post('/api/admin/payments/:id/approve', requireAdmin, async (req: Request, res: Response) => {
+// Approve / Verify a pending bank transfer payment (Admin only)
+const handleAdminApproveBankTransfer = async (req: Request, res: Response) => {
   try {
     const admin = (req as any).user as AuthenticatedUser;
-    const { id } = req.params;
+    const idOrOrderNumber = String(
+      req.params.id || req.body?.orderNumber || req.body?.paymentId || req.body?.id || ''
+    ).trim();
+
+    if (!idOrOrderNumber) {
+      return res.status(400).json({
+        error: 'MISSING_PAYMENT_ID',
+        message: 'Захиалгын дугаар эсвэл ID шаардлагатай.'
+      });
+    }
 
     const result = await Storage.approveBankTransferPayment({
-      idOrOrderNumber: id,
+      idOrOrderNumber,
       adminId: admin.id,
       adminEmail: admin.email
     });
@@ -1192,10 +1475,13 @@ app.post('/api/admin/payments/:id/approve', requireAdmin, async (req: Request, r
       message: `Захиалга (${result.payment.orderNumber}) амжилттай баталгаажиж, гишүүнчлэл идэвхжлээ.`
     });
   } catch (err: any) {
-    const status = err?.code === 'ORDER_NOT_FOUND' ? 404 : err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'APPROVE_FAILED', message: err.message });
+    return sendApiError(res, err, 'APPROVE_FAILED', 'Захиалга баталгаажуулахад алдаа гарлаа.');
   }
-});
+};
+
+app.post('/api/admin/payments/:id/approve', requireAdmin, handleAdminApproveBankTransfer);
+app.post('/api/admin/payments/:id/verify', requireAdmin, handleAdminApproveBankTransfer);
+app.post('/api/admin/payments/bank-transfer/verify', requireAdmin, handleAdminApproveBankTransfer);
 
 // Reject a bank transfer payment (Admin only)
 app.post('/api/admin/payments/:id/reject', requireAdmin, async (req: Request, res: Response) => {
@@ -1217,8 +1503,7 @@ app.post('/api/admin/payments/:id/reject', requireAdmin, async (req: Request, re
       message: `Захиалга (${payment.orderNumber}) татгалзагдлаа.`
     });
   } catch (err: any) {
-    const status = err?.code === 'ORDER_NOT_FOUND' ? 404 : err?.statusCode || 500;
-    res.status(status).json({ error: err?.code || 'REJECT_FAILED', message: err.message });
+    return sendApiError(res, err, 'REJECT_FAILED', 'Захиалга татгалзахад алдаа гарлаа.');
   }
 });
 
@@ -1246,7 +1531,7 @@ app.get('/api/admin/subscriptions', requireAdmin, async (_req: Request, res: Res
 
     res.json({ success: true, subscriptions: enriched });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1270,7 +1555,7 @@ app.post('/api/admin/subscriptions/adjust', requireAdmin, async (req: Request, r
 
     res.json({ success: true, subscription: sub, message: 'Гишүүнчлэлийг амжилттай тохирууллаа.' });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1280,7 +1565,7 @@ app.get('/api/admin/audit-logs', requireAdmin, async (_req: Request, res: Respon
     const logs = await Storage.getAuditLogs(100);
     res.json({ success: true, logs });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1298,7 +1583,7 @@ app.get('/api/admin/settings', requireAdmin, async (_req: Request, res: Response
       }
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1319,7 +1604,7 @@ app.put('/api/admin/settings', requireAdmin, async (req: Request, res: Response)
       message: 'Сайтын тохиргоо амжилттай хадгалагдлаа.'
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1412,13 +1697,53 @@ app.post('/api/admin/upload', requireAdmin, async (req: Request, res: Response) 
     });
   } catch (err: any) {
     console.error('[Admin/Upload] Error:', err);
-    return res.status(500).json({ error: 'UPLOAD_FAILED', message: err.message });
+    return sendApiError(res, err, 'UPLOAD_FAILED', err?.message || 'Зураг хуулахад алдаа гарлаа.', 500);
   }
 });
 
-app.get('/api/health', (_req: Request, res: Response) => {
+app.get('/api/health', async (_req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-store');
-  return res.json({ ok: true, service: 'ai-movie-api' });
+
+  if (!isMongoUriConfigured()) {
+    const dbStatus = getDatabaseStatus();
+    return res.status(503).json({
+      ok: false,
+      service: 'ai-movie-api',
+      error: 'DATABASE_NOT_CONFIGURED',
+      message: 'MONGODB_URI is not configured.',
+      database: dbStatus
+    });
+  }
+
+  try {
+    await connectDB();
+  } catch (err: any) {
+    const dbStatus = getDatabaseStatus();
+    return res.status(503).json({
+      ok: false,
+      service: 'ai-movie-api',
+      error: err?.code || 'DATABASE_UNAVAILABLE',
+      message: err?.message || 'MongoDB connection failed',
+      database: dbStatus
+    });
+  }
+
+  const dbStatus = getDatabaseStatus();
+  if (!dbStatus.connected || !isMongoActive()) {
+    return res.status(503).json({
+      ok: false,
+      service: 'ai-movie-api',
+      error: 'DATABASE_UNAVAILABLE',
+      message: 'MongoDB is not connected.',
+      database: dbStatus
+    });
+  }
+
+  return res.json({
+    ok: true,
+    service: 'ai-movie-api',
+    database: dbStatus
+  });
 });
 
 // -------------------------------------------------------------
@@ -1457,7 +1782,7 @@ app.get('/api/subscription', async (req: Request, res: Response) => {
         : null
     });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1467,6 +1792,57 @@ app.get('/api/subscription', async (req: Request, res: Response) => {
 // -------------------------------------------------------------
 app.get('/api/bank-details', (_req: Request, res: Response) => {
   res.json({ bankDetails: BANK_TRANSFER_DETAILS });
+});
+
+// -------------------------------------------------------------
+// 3b. 18+ Age Verification Endpoints (Hot+ / 18+ Gate)
+// -------------------------------------------------------------
+app.get('/api/age-verification/status', (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const verified = isRequestAgeVerified(req);
+  const existingToken =
+    readCookie(req, AGE_VERIFIED_COOKIE) || (req.get('x-age-verified-token') || '').trim() || null;
+  res.json({
+    verified,
+    token: verified ? existingToken : null
+  });
+});
+
+app.post('/api/age-verification/confirm', (req: Request, res: Response) => {
+  const confirmed = req.body?.confirmed !== false;
+  if (!confirmed) {
+    return res.status(400).json({
+      verified: false,
+      error: 'CONFIRMATION_REQUIRED',
+      message: 'Та 18 нас хүрсэн гэдгээ баталгаажуулах шаардлагатай.'
+    });
+  }
+
+  const maxAgeSeconds = 24 * 60 * 60; // 24 hours
+  const { token, expiresAt } = createSessionToken('age_verified_18plus', maxAgeSeconds);
+  const secure = isProduction ? '; Secure' : '';
+  res.setHeader(
+    'Set-Cookie',
+    `${AGE_VERIFIED_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`
+  );
+  res.json({
+    success: true,
+    verified: true,
+    token,
+    expiresAt
+  });
+});
+
+app.post('/api/age-verification/revoke', (_req: Request, res: Response) => {
+  const secure = isProduction ? '; Secure' : '';
+  res.setHeader(
+    'Set-Cookie',
+    `${AGE_VERIFIED_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`
+  );
+  res.json({
+    success: true,
+    verified: false
+  });
 });
 
 // -------------------------------------------------------------
@@ -1569,10 +1945,122 @@ app.post('/api/payments/create', async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     console.error('[Payments/Create] Error:', error);
-    res.status(error?.statusCode || 500).json({
-      error: error?.code || 'PAYMENT_CREATION_FAILED',
-      message: error?.message || 'Төлбөрийн захиалга үүсгэхэд алдаа гарлаа.'
+    return sendApiError(res, error, 'PAYMENT_CREATION_FAILED', error?.message || 'Төлбөрийн захиалга үүсгэхэд алдаа гарлаа.');
+  }
+});
+
+// -------------------------------------------------------------
+// 4b. Series Rental / All-Episodes Unlock Payment Creation
+// POST /api/payments/create-rental
+// -------------------------------------------------------------
+app.post('/api/payments/create-rental', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({
+        error: 'AUTH_REQUIRED',
+        message: 'Цуврал түрээслэх эсвэл нээхийн тулд эхлээд системд нэвтэрнэ үү.'
+      });
+    }
+
+    const { seriesId, paymentMethod = 'wire_qpay', accessType = 'rental' } = req.body || {};
+    if (!seriesId) {
+      return res.status(400).json({
+        error: 'MISSING_SERIES_ID',
+        message: 'Цувралын ID шаардлагатай.'
+      });
+    }
+
+    const movie = await Storage.getMovieById(String(seriesId));
+    if (!movie) {
+      return res.status(404).json({
+        error: 'MOVIE_NOT_FOUND',
+        message: 'Цуврал олдсонгүй.'
+      });
+    }
+
+    const serverAmount = Math.max(500, Number(movie.unlockPrice) || 4900);
+    const rentalDurationHours = Math.max(1, Number(movie.rentalDurationHours) || 72);
+    const currency = 'MNT';
+
+    const orderNumber = `AIRENT-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const idempotencyKey = `order_${orderNumber}_pi`;
+    const baseUrl = getBaseUrl(req);
+    const successUrl = `${baseUrl}/payment/success?order=${orderNumber}`;
+    const cancelUrl = `${baseUrl}/payment/cancel?order=${orderNumber}`;
+
+    let wirePaymentIntentId = `pi_airent_${orderNumber}`;
+    let wireCheckoutSessionId = `cs_airent_${orderNumber}`;
+    let checkoutUrl = `${baseUrl}/checkout/${orderNumber}`;
+
+    if (paymentMethod === 'wire_qpay' && defaultWireService.isConfigured()) {
+      const paymentIntent = await defaultWireService.createPaymentIntent({
+        amount: serverAmount,
+        currency: 'MNT',
+        description: `AI MOVIE Series Unlock: ${movie.titleEn || movie.titleMn} (${rentalDurationHours}h)`,
+        metadata: {
+          order_id: orderNumber,
+          user_id: user.id,
+          plan_id: `series_${movie.id}`
+        },
+        idempotencyKey
+      });
+
+      wirePaymentIntentId = paymentIntent.id;
+
+      const checkoutSession = await defaultWireService.createCheckoutSession({
+        payment_intent: paymentIntent.id,
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+        idempotencyKey: `order_${orderNumber}_cs`
+      });
+
+      wireCheckoutSessionId = checkoutSession.id;
+      checkoutUrl = checkoutSession.url;
+    } else if (paymentMethod === 'bank_transfer') {
+      wirePaymentIntentId = `bank_transfer_${orderNumber}`;
+    }
+
+    const payment = await Storage.createPayment({
+      userId: user.id,
+      orderNumber,
+      planId: `series_${movie.id}`,
+      seriesId: movie.id,
+      accessType: accessType === 'permanent' ? 'permanent' : 'rental',
+      rentalDurationHours,
+      paymentMethod,
+      wirePaymentIntentId,
+      wireCheckoutSessionId: paymentMethod === 'wire_qpay' ? wireCheckoutSessionId : undefined,
+      amount: serverAmount,
+      currency,
+      status: 'PENDING',
+      checkoutUrl
     });
+
+    res.json({
+      success: true,
+      orderNumber: payment.orderNumber,
+      seriesId: movie.id,
+      accessType: payment.accessType,
+      rentalDurationHours,
+      paymentMethod,
+      checkoutUrl,
+      paymentIntentId: wirePaymentIntentId,
+      checkoutSessionId: wireCheckoutSessionId,
+      amount: serverAmount,
+      currency,
+      bankTransferDetails: BANK_TRANSFER_DETAILS,
+      series: {
+        id: movie.id,
+        titleMn: movie.titleMn,
+        titleEn: movie.titleEn,
+        price: serverAmount,
+        rentalDurationHours
+      }
+    });
+  } catch (error: any) {
+    console.error('[Payments/CreateRental] Error:', error);
+    return sendApiError(res, error, 'RENTAL_CREATION_FAILED', error?.message || 'Түрээсийн захиалга үүсгэхэд алдаа гарлаа.');
   }
 });
 
@@ -1594,55 +2082,33 @@ app.post('/api/payments/bank-transfer/confirm', async (req: Request, res: Respon
       return res.status(400).json({ error: 'MISSING_ORDER_NUMBER', message: 'orderNumber шаардлагатай.' });
     }
 
-    const payment = await Storage.getPaymentByOrderNumber(orderNumber);
-    if (!payment) {
-      return res.status(404).json({ error: 'ORDER_NOT_FOUND', message: 'Захиалга олдсонгүй.' });
-    }
-
-    if (payment.userId !== user.id) {
-      return res.status(403).json({ error: 'UNAUTHORIZED_ACCESS', message: 'Энэ захиалгад хандах эрхгүй байна.' });
-    }
-
-    if (payment.status === 'PAID') {
-      return res.json({
-        success: true,
-        status: 'PAID',
-        message: 'Захиалга аль хэдийн баталгаажсан байна.',
-        orderNumber
-      });
-    }
-
-    const refString = transferRef ? String(transferRef).trim() : `TXN-${Date.now().toString().slice(-6)}`;
-    const sender = senderName
-      ? `${String(senderName).trim()}${phone ? ` (${String(phone).trim()})` : ''}`
-      : user.name;
-
     // Security rule: Bank transfer submission places order into PENDING_REVIEW.
-    // It MUST NOT mark payment PAID or activate subscription until admin approval!
-    const updated = await Storage.updatePaymentStatus(payment.orderNumber, 'PENDING_REVIEW', {
-      bankSenderName: sender,
-      bankTransferRef: refString,
-      previousStatus: payment.status
+    // It MUST NOT mark payment PAID or activate subscription until explicit admin verification!
+    const updated = await Storage.submitBankTransferForReview({
+      orderNumber: String(orderNumber),
+      userId: user.id,
+      senderName: senderName ? String(senderName) : undefined,
+      phone: phone ? String(phone) : undefined,
+      transferRef: transferRef ? String(transferRef) : undefined,
+      fallbackUserName: user.name
     });
 
     console.log(
-      `[BankTransfer] Order ${payment.orderNumber} submitted by user ${payment.userId} for admin review (status=PENDING_REVIEW).`
+      `[BankTransfer] Order ${updated.orderNumber} submitted by user ${updated.userId} for admin review (status=${updated.status}).`
     );
 
     res.json({
       success: true,
       message:
         'Дансны шилжүүлгийн мэдээлэл хүлээн авагдлаа. Администратор гүйлгээг шалгасны дараа таны гишүүнчлэл идэвхжинэ.',
-      orderNumber: payment.orderNumber,
-      planId: payment.planId,
-      status: updated?.status || 'PENDING_REVIEW'
+      orderNumber: updated.orderNumber,
+      planId: updated.planId,
+      status: updated.status,
+      payment: updated
     });
   } catch (error: any) {
     console.error('[BankTransfer/Confirm] Error:', error);
-    res.status(error?.statusCode || 500).json({
-      error: error?.code || 'SERVER_ERROR',
-      message: error?.message || 'Баталгаажуулахад алдаа гарлаа.'
-    });
+    return sendApiError(res, error, 'SERVER_ERROR', 'Баталгаажуулахад алдаа гарлаа.');
   }
 });
 
@@ -1681,7 +2147,7 @@ app.get('/api/payments/history', async (req: Request, res: Response) => {
 
     res.json({ payments: formatted });
   } catch (err: any) {
-    res.status(err?.statusCode || 500).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1726,12 +2192,31 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
               paidAt: new Date(),
               wireChargeId: wirePi.charges?.data?.[0]?.id
             });
-            await Storage.activateSubscription({
-              userId: payment.userId,
-              planId: payment.planId,
-              paymentId: payment.orderNumber,
-              durationDays: 30
-            });
+            if (payment.seriesId) {
+              const hours = payment.rentalDurationHours || 72;
+              await Storage.recordSeriesPurchase({
+                userId: payment.userId,
+                seriesId: payment.seriesId,
+                accessType: payment.accessType === 'permanent' ? 'permanent' : 'rental',
+                amount: payment.amount,
+                currency: payment.currency || 'MNT',
+                paymentId: payment.orderNumber,
+                orderNumber: payment.orderNumber,
+                status: 'ACTIVE',
+                purchasedAt: new Date(),
+                expiresAt:
+                  payment.accessType === 'permanent'
+                    ? null
+                    : new Date(Date.now() + hours * 3600 * 1000)
+              });
+            } else {
+              await Storage.activateSubscription({
+                userId: payment.userId,
+                planId: payment.planId,
+                paymentId: payment.orderNumber,
+                durationDays: 30
+              });
+            }
             payment.status = 'PAID';
             payment.paidAt = new Date();
           }
@@ -1766,10 +2251,7 @@ app.get('/api/payments/:orderId', async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     console.error('[Payments/Get] Error:', error);
-    res.status(error?.statusCode || 500).json({
-      error: error?.code || 'SERVER_ERROR',
-      message: 'Захиалгын мэдээлэл авахад алдаа гарлаа.'
-    });
+    return sendApiError(res, error, 'SERVER_ERROR', 'Захиалгын мэдээлэл авахад алдаа гарлаа.');
   }
 });
 
@@ -1817,107 +2299,131 @@ app.post('/api/webhooks/wire', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'MISSING_EVENT_ID' });
   }
 
-  // 3. Deduplication check
-  const alreadyProcessed = await Storage.hasProcessedWebhookEvent(eventId);
-  if (alreadyProcessed) {
-    console.log(`[Webhook/Wire] Event ${eventId} was already processed, returning 200 OK.`);
-    return res.status(200).json({ received: true, deduplicated: true });
-  }
-
-  // 4. Handle payment_intent.succeeded
-  if (eventType === 'payment_intent.succeeded') {
-    const paymentIntentData = event.data?.object;
-    const paymentIntentId = paymentIntentData?.id;
-
-    if (!paymentIntentId) {
-      return res.status(400).json({ error: 'MISSING_PAYMENT_INTENT_ID' });
+  try {
+    // 3. Deduplication check
+    const alreadyProcessed = await Storage.hasProcessedWebhookEvent(eventId);
+    if (alreadyProcessed) {
+      console.log(`[Webhook/Wire] Event ${eventId} was already processed, returning 200 OK.`);
+      return res.status(200).json({ received: true, deduplicated: true });
     }
 
-    const order = await Storage.getPaymentByIntentId(paymentIntentId);
-    if (!order) {
-      console.warn(`[Webhook/Wire] Order not found for PaymentIntent ${paymentIntentId}`);
-      await Storage.recordWebhookEvent({
-        eventId,
-        eventType,
-        paymentIntentId,
-        processed: true,
-        payloadSummary: 'Order not found in DB'
+    // 4. Handle payment_intent.succeeded
+    if (eventType === 'payment_intent.succeeded') {
+      const paymentIntentData = event.data?.object;
+      const paymentIntentId = paymentIntentData?.id;
+
+      if (!paymentIntentId) {
+        return res.status(400).json({ error: 'MISSING_PAYMENT_INTENT_ID' });
+      }
+
+      const order = await Storage.getPaymentByIntentId(paymentIntentId);
+      if (!order) {
+        console.warn(`[Webhook/Wire] Order not found for PaymentIntent ${paymentIntentId}`);
+        await Storage.recordWebhookEvent({
+          eventId,
+          eventType,
+          paymentIntentId,
+          processed: true,
+          payloadSummary: 'Order not found in DB'
+        });
+        return res.status(200).json({ received: true, warning: 'Order not found' });
+      }
+
+      if (order.status === 'PAID') {
+        console.log(`[Webhook/Wire] Order ${order.orderNumber} already fulfilled.`);
+        await Storage.recordWebhookEvent({
+          eventId,
+          eventType,
+          paymentIntentId,
+          processed: true
+        });
+        return res.status(200).json({ received: true, note: 'Already fulfilled' });
+      }
+
+      let verifiedIntent: any = paymentIntentData;
+      if (defaultWireService.isConfigured()) {
+        try {
+          verifiedIntent = await defaultWireService.getPaymentIntent(paymentIntentId);
+        } catch (wireErr: any) {
+          console.error(`[Webhook/Wire] Failed to verify intent ${paymentIntentId} with Wire API:`, wireErr.message);
+          return res.status(502).json({ error: 'WIRE_API_VERIFICATION_FAILED' });
+        }
+      }
+
+      if (verifiedIntent.status !== 'succeeded') {
+        console.warn(`[Webhook/Wire] Verified intent status is '${verifiedIntent.status}', not 'succeeded'`);
+        return res.status(400).json({ error: 'INTENT_NOT_SUCCEEDED' });
+      }
+
+      if (verifiedIntent.amount !== order.amount) {
+        console.error(
+          `[Webhook/Wire] Amount mismatch! Expected ${order.amount} MNT, got ${verifiedIntent.amount} MNT`
+        );
+        return res.status(400).json({ error: 'AMOUNT_MISMATCH' });
+      }
+
+      if (verifiedIntent.currency !== 'MNT') {
+        console.error(`[Webhook/Wire] Currency mismatch! Expected MNT, got ${verifiedIntent.currency}`);
+        return res.status(400).json({ error: 'CURRENCY_MISMATCH' });
+      }
+
+      const chargeId = verifiedIntent.charges?.data?.[0]?.id;
+      await Storage.updatePaymentStatus(order.orderNumber, 'PAID', {
+        paidAt: new Date(),
+        wireChargeId: chargeId
       });
-      return res.status(200).json({ received: true, warning: 'Order not found' });
-    }
 
-    if (order.status === 'PAID') {
-      console.log(`[Webhook/Wire] Order ${order.orderNumber} already fulfilled.`);
+      if (order.seriesId) {
+        const hours = order.rentalDurationHours || 72;
+        await Storage.recordSeriesPurchase({
+          userId: order.userId,
+          seriesId: order.seriesId,
+          accessType: order.accessType === 'permanent' ? 'permanent' : 'rental',
+          amount: order.amount,
+          currency: order.currency || 'MNT',
+          paymentId: order.orderNumber,
+          orderNumber: order.orderNumber,
+          status: 'ACTIVE',
+          purchasedAt: new Date(),
+          expiresAt:
+            order.accessType === 'permanent'
+              ? null
+              : new Date(Date.now() + hours * 3600 * 1000)
+        });
+      } else {
+        await Storage.activateSubscription({
+          userId: order.userId,
+          planId: order.planId,
+          paymentId: order.orderNumber,
+          durationDays: 30
+        });
+      }
+
       await Storage.recordWebhookEvent({
         eventId,
         eventType,
         paymentIntentId,
         processed: true
       });
-      return res.status(200).json({ received: true, note: 'Already fulfilled' });
-    }
 
-    let verifiedIntent: any = paymentIntentData;
-    if (defaultWireService.isConfigured()) {
-      try {
-        verifiedIntent = await defaultWireService.getPaymentIntent(paymentIntentId);
-      } catch (wireErr: any) {
-        console.error(`[Webhook/Wire] Failed to verify intent ${paymentIntentId} with Wire API:`, wireErr.message);
-        return res.status(502).json({ error: 'WIRE_API_VERIFICATION_FAILED' });
-      }
-    }
-
-    if (verifiedIntent.status !== 'succeeded') {
-      console.warn(`[Webhook/Wire] Verified intent status is '${verifiedIntent.status}', not 'succeeded'`);
-      return res.status(400).json({ error: 'INTENT_NOT_SUCCEEDED' });
-    }
-
-    if (verifiedIntent.amount !== order.amount) {
-      console.error(
-        `[Webhook/Wire] Amount mismatch! Expected ${order.amount} MNT, got ${verifiedIntent.amount} MNT`
+      console.log(
+        `[Webhook/Wire] Successfully processed payment_intent.succeeded for order ${order.orderNumber}, activated plan ${order.planId} for user ${order.userId}`
       );
-      return res.status(400).json({ error: 'AMOUNT_MISMATCH' });
+      return res.status(200).json({ success: true, orderNumber: order.orderNumber, planId: order.planId });
     }
-
-    if (verifiedIntent.currency !== 'MNT') {
-      console.error(`[Webhook/Wire] Currency mismatch! Expected MNT, got ${verifiedIntent.currency}`);
-      return res.status(400).json({ error: 'CURRENCY_MISMATCH' });
-    }
-
-    const chargeId = verifiedIntent.charges?.data?.[0]?.id;
-    await Storage.updatePaymentStatus(order.orderNumber, 'PAID', {
-      paidAt: new Date(),
-      wireChargeId: chargeId
-    });
-
-    await Storage.activateSubscription({
-      userId: order.userId,
-      planId: order.planId,
-      paymentId: order.orderNumber,
-      durationDays: 30
-    });
 
     await Storage.recordWebhookEvent({
       eventId,
       eventType,
-      paymentIntentId,
+      paymentIntentId: event.data?.object?.id || 'unknown',
       processed: true
     });
 
-    console.log(
-      `[Webhook/Wire] Successfully processed payment_intent.succeeded for order ${order.orderNumber}, activated plan ${order.planId} for user ${order.userId}`
-    );
-    return res.status(200).json({ success: true, orderNumber: order.orderNumber, planId: order.planId });
+    return res.status(200).json({ received: true });
+  } catch (err: any) {
+    console.error('[Webhook/Wire] Database or processing error:', err);
+    return sendApiError(res, err, 'WEBHOOK_PROCESSING_FAILED', err?.message || 'Webhook боловсруулахад алдаа гарлаа.', 500);
   }
-
-  await Storage.recordWebhookEvent({
-    eventId,
-    eventType,
-    paymentIntentId: event.data?.object?.id || 'unknown',
-    processed: true
-  });
-
-  res.status(200).json({ received: true });
 });
 
 // -------------------------------------------------------------
@@ -1936,19 +2442,60 @@ app.get('/api/movies', async (req: Request, res: Response) => {
       genre
     });
 
-    const publicList = list.map((m) => {
+    const user = await getAuthenticatedUser(req);
+    const ageVerified = isRequestAgeVerified(req);
+    const filteredList = filterMoviesForAgeGate(list as any[], ageVerified, user?.role);
+
+    const publicList = filteredList.map((m) => {
       const { videoSource, videoUrl, ...rest } = m as any;
-      return rest;
+      return {
+        ...rest,
+        posterUrl: resolveSafePosterUrl(rest.posterUrl, rest.id)
+      };
     });
 
-    res.json({ movies: publicList });
+    res.json({ movies: publicList, ageVerified });
   } catch (err: any) {
     console.error('[API/Movies] Error:', err);
-    const status = err?.statusCode || 500;
-    res.status(status).json({
-      error: err?.code || 'MOVIES_FETCH_FAILED',
-      message: err.message || 'Киноны жагсаалт ачаалахад алдаа гарлаа.'
+    return sendApiError(res, err, 'MOVIES_FETCH_FAILED', err?.message || 'Киноны жагсаалт ачаалахад алдаа гарлаа.');
+  }
+});
+
+// Real-time debounced movie title search suggestions endpoint
+app.get('/api/movies/suggestions', async (req: Request, res: Response) => {
+  try {
+    const query = String(req.query.q ?? req.query.search ?? '').trim();
+    const limitParam = parseInt(String(req.query.limit || '6'), 10);
+    const limit = Number.isFinite(limitParam) ? Math.min(10, Math.max(1, limitParam)) : 6;
+
+    if (!query) {
+      return res.json({ query: '', suggestions: [] });
+    }
+
+    const list = await Storage.getAllMovies({
+      publishedOnly: true,
+      search: query
     });
+
+    const user = await getAuthenticatedUser(req);
+    const ageVerified = isRequestAgeVerified(req);
+    const safeList = filterMoviesForAgeGate(list as any[], ageVerified, user?.role);
+
+    const ranked = getMovieTitleSuggestions(safeList as any, query, limit).map((m) => {
+      const { videoSource, videoUrl, ...rest } = m as any;
+      return {
+        ...rest,
+        posterUrl: resolveSafePosterUrl(rest.posterUrl, rest.id)
+      };
+    });
+
+    return res.json({
+      query,
+      suggestions: ranked
+    });
+  } catch (err: any) {
+    console.error('[API/Movies/Suggestions] Error:', err);
+    return sendApiError(res, err, 'SUGGESTIONS_FETCH_FAILED', err?.message || 'Хайлтын санал ачаалахад алдаа гарлаа.');
   }
 });
 
@@ -1962,11 +2509,22 @@ app.get('/api/movies/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Кино олдсонгүй.' });
     }
 
+    if (isAdultRestrictedMovie(movie as any) && !isRequestAgeVerified(req) && user?.role !== 'admin') {
+      return res.status(403).json({
+        error: 'AGE_VERIFICATION_REQUIRED',
+        message: 'Энэ хэсэгт зөвхөн 18 нас хүрсэн хэрэглэгч үзэх боломжтой контент байрлана.'
+      });
+    }
+
     const { videoSource, videoUrl, ...publicMovie } = movie as any;
-    return res.json({ movie: publicMovie });
+    return res.json({
+      movie: {
+        ...publicMovie,
+        posterUrl: resolveSafePosterUrl(publicMovie.posterUrl, publicMovie.id)
+      }
+    });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -1984,6 +2542,13 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
     }
 
     const user = await getAuthenticatedUser(req);
+    if (isAdultRestrictedMovie(movie as any) && !isRequestAgeVerified(req) && user?.role !== 'admin') {
+      return res.status(403).json({
+        error: 'AGE_VERIFICATION_REQUIRED',
+        message: 'Энэ киног үзэхийн тулд 18 нас хүрсэн гэдгээ баталгаажуулах шаардлагатай.'
+      });
+    }
+
     const activeSub = user ? await Storage.getActiveSubscription(user.id) : null;
 
     const access = checkMovieAccess({
@@ -2023,8 +2588,204 @@ app.get('/api/movies/:id/stream', async (req: Request, res: Response) => {
       token: signedToken
     });
   } catch (err: any) {
-    const status = err?.statusCode || 500;
-    return res.status(status).json({ error: err?.code || 'SERVER_ERROR', message: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
+  }
+});
+
+// -------------------------------------------------------------
+// 8b. Public Series Episodes List & Server-Verified Episode Stream
+// -------------------------------------------------------------
+app.get('/api/movies/:id/episodes', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const movie = await Storage.getMovieById(id);
+    if (!movie) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Цуврал олдсонгүй.' });
+    }
+
+    const user = await getAuthenticatedUser(req);
+    if (isAdultRestrictedMovie(movie as any) && !isRequestAgeVerified(req) && user?.role !== 'admin') {
+      return res.status(403).json({
+        error: 'AGE_VERIFICATION_REQUIRED',
+        message: 'Энэ хэсэгт зөвхөн 18 нас хүрсэн хэрэглэгч үзэх боломжтой контент байрлана.'
+      });
+    }
+
+    const episodes = await Storage.getEpisodesBySeriesId(movie.id, true);
+    const activePurchase = user ? await Storage.getActiveSeriesPurchase(user.id, movie.id) : null;
+    const activeSub = user ? await Storage.getActiveSubscription(user.id) : null;
+    const progressList = user ? await Storage.getUserPlaybackProgress(user.id, movie.id) : [];
+
+    // Strip raw videoUrl from public listing for locked episodes
+    const sanitizedEpisodes = episodes.map((ep) => {
+      const allowed = canAccessEpisode({
+        episodeNumber: ep.episodeNumber,
+        freeEpisodes: movie.freeEpisodes ?? 6,
+        episodeIsFree: ep.isFree,
+        hasActiveVip: Boolean(activeSub && activeSub.status === 'ACTIVE'),
+        vipEnabled: movie.vipEnabled !== false,
+        hasActiveSeriesPurchase: Boolean(activePurchase),
+        userRole: user?.role
+      });
+
+      return {
+        id: ep.id,
+        seriesId: ep.seriesId,
+        episodeNumber: ep.episodeNumber,
+        title: ep.title,
+        titleEn: ep.titleEn,
+        duration: ep.duration,
+        thumbnailUrl: ep.thumbnailUrl || movie.posterUrl,
+        subtitleUrlMn: ep.subtitleUrlMn,
+        isFree: ep.isFree,
+        unlocked: allowed
+      };
+    });
+
+    res.json({
+      success: true,
+      seriesId: movie.id,
+      totalEpisodes: movie.totalEpisodes || sanitizedEpisodes.length,
+      freeEpisodes: movie.freeEpisodes ?? 6,
+      unlockPrice: movie.unlockPrice ?? 4900,
+      rentalDurationHours: movie.rentalDurationHours ?? 72,
+      vipEnabled: movie.vipEnabled !== false,
+      purchase: activePurchase,
+      hasActiveVip: Boolean(activeSub && activeSub.status === 'ACTIVE'),
+      episodeProgress: progressList,
+      episodes: sanitizedEpisodes
+    });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Ангиудын мэдээлэл ачаалахад алдаа гарлаа.');
+  }
+});
+
+app.get('/api/movies/:id/episodes/:episodeNumber/stream', async (req: Request, res: Response) => {
+  try {
+    const { id, episodeNumber } = req.params;
+    const epNum = Math.max(1, Math.floor(Number(episodeNumber) || 1));
+    const movie = await Storage.getMovieById(id);
+
+    if (!movie) {
+      return res.status(404).json({ error: 'MOVIE_NOT_FOUND', message: 'Цуврал олдсонгүй.' });
+    }
+
+    const episodes = await Storage.getEpisodesBySeriesId(movie.id, false);
+    const targetEpisode = episodes.find((e) => e.episodeNumber === epNum);
+
+    const user = await getAuthenticatedUser(req);
+    if (isAdultRestrictedMovie(movie as any) && !isRequestAgeVerified(req) && user?.role !== 'admin') {
+      return res.status(403).json({
+        error: 'AGE_VERIFICATION_REQUIRED',
+        message: 'Энэ ангийг үзэхийн тулд 18 нас хүрсэн гэдгээ баталгаажуулах шаардлагатай.'
+      });
+    }
+
+    const activeSub = user ? await Storage.getActiveSubscription(user.id) : null;
+    const activePurchase = user ? await Storage.getActiveSeriesPurchase(user.id, movie.id) : null;
+
+    const allowed = canAccessEpisode({
+      episodeNumber: epNum,
+      freeEpisodes: movie.freeEpisodes ?? 6,
+      episodeIsFree: targetEpisode?.isFree,
+      hasActiveVip: Boolean(activeSub && activeSub.status === 'ACTIVE'),
+      vipEnabled: movie.vipEnabled !== false,
+      hasActiveSeriesPurchase: Boolean(activePurchase),
+      userRole: user?.role
+    });
+
+    if (!allowed) {
+      return res.status(403).json({
+        authorized: false,
+        error: 'EPISODE_LOCKED',
+        episodeNumber: epNum,
+        freeEpisodes: movie.freeEpisodes ?? 6,
+        paidStartingEpisode: (movie.freeEpisodes ?? 6) + 1,
+        unlockPrice: movie.unlockPrice ?? 4900,
+        rentalDurationHours: movie.rentalDurationHours ?? 72,
+        vipEnabled: movie.vipEnabled !== false,
+        message: `${epNum}-р анги түгжээтэй байна. Эхний ${movie.freeEpisodes ?? 6} анги үнэгүй. Цааш бүх ангийг ${(movie.unlockPrice ?? 4900).toLocaleString()}₮-өөр ${movie.rentalDurationHours ?? 72} цаг түрээслэх эсвэл VIP багцаар хязгааргүй үзээрэй.`
+      });
+    }
+
+    Storage.incrementMovieViews(movie.id).catch(() => {});
+
+    const userId = user ? user.id : 'guest';
+    const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
+    const tokenSecret = getAuthSecret();
+    const tokenPayload = `${movie.id}:ep${epNum}:${userId}:${expiresAt}`;
+    const signedToken = crypto.createHmac('sha256', tokenSecret).update(tokenPayload).digest('hex');
+
+    const streamUrl = targetEpisode?.videoUrl || movie.videoUrl || movie.videoSource;
+
+    res.json({
+      authorized: true,
+      movieId: movie.id,
+      episodeNumber: epNum,
+      episodeTitle: targetEpisode?.title || `${epNum}-р анги`,
+      duration: targetEpisode?.duration || '2 мин',
+      subtitleUrlMn: targetEpisode?.subtitleUrlMn || '',
+      quality: movie.quality || '1080p Full HD',
+      streamUrl,
+      expiresAt,
+      token: signedToken
+    });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Анги тоглуулахад алдаа гарлаа.');
+  }
+});
+
+// -------------------------------------------------------------
+// 8c. User Series Purchases & Playback Progress APIs
+// -------------------------------------------------------------
+app.get('/api/purchases/series', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.json({ purchases: [] });
+    }
+    const purchases = await Storage.getUserSeriesPurchases(user.id);
+    res.json({ purchases });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
+  }
+});
+
+app.get('/api/watch-progress', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.json({ progress: [] });
+    }
+    const movieId = req.query.movieId ? String(req.query.movieId) : undefined;
+    const progress = await Storage.getUserPlaybackProgress(user.id, movieId);
+    res.json({ progress });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
+  }
+});
+
+app.post('/api/watch-progress', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'AUTH_REQUIRED', message: 'Нэвтэрч орно уу.' });
+    }
+    const { movieId, episodeNumber = 1, currentTime = 0, duration = 0, completed } = req.body || {};
+    if (!movieId) {
+      return res.status(400).json({ error: 'MISSING_MOVIE_ID', message: 'movieId шаардлагатай.' });
+    }
+    const item = await Storage.saveUserPlaybackProgress({
+      userId: user.id,
+      movieId: String(movieId),
+      episodeNumber: Number(episodeNumber) || 1,
+      currentTime: Number(currentTime) || 0,
+      duration: Number(duration) || 0,
+      completed: completed !== undefined ? Boolean(completed) : false
+    });
+    res.json({ success: true, progress: item });
+  } catch (err: any) {
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
 });
 
@@ -2098,12 +2859,33 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
       wireChargeId: `ch_wire_${orderNumber}`
     });
 
-    const sub = await Storage.activateSubscription({
-      userId: order.userId,
-      planId: order.planId,
-      paymentId: order.orderNumber,
-      durationDays: 30
-    });
+    let sub = null;
+    let seriesPurchase = null;
+    if (order.seriesId) {
+      const hours = order.rentalDurationHours || 72;
+      seriesPurchase = await Storage.recordSeriesPurchase({
+        userId: order.userId,
+        seriesId: order.seriesId,
+        accessType: order.accessType === 'permanent' ? 'permanent' : 'rental',
+        amount: order.amount,
+        currency: order.currency || 'MNT',
+        paymentId: order.orderNumber,
+        orderNumber: order.orderNumber,
+        status: 'ACTIVE',
+        purchasedAt: new Date(),
+        expiresAt:
+          order.accessType === 'permanent'
+            ? null
+            : new Date(Date.now() + hours * 3600 * 1000)
+      });
+    } else {
+      sub = await Storage.activateSubscription({
+        userId: order.userId,
+        planId: order.planId,
+        paymentId: order.orderNumber,
+        durationDays: 30
+      });
+    }
 
     await Storage.recordWebhookEvent({
       eventId,
@@ -2118,11 +2900,17 @@ app.post('/api/test/simulate-wire-payment', async (req: Request, res: Response) 
       eventId,
       signatureHeader,
       orderNumber: order.orderNumber,
-      subscription: sub
+      subscription: sub,
+      seriesPurchase
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    return sendApiError(res, err, 'SERVER_ERROR', err?.message);
   }
+});
+
+// Global API error handler: ensures any uncaught database connectivity failure returns 503
+app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) => {
+  return sendApiError(res, err, 'SERVER_ERROR', err?.message || 'Сервер дээр алдаа гарлаа.');
 });
 
 // API paths must always produce JSON, including unknown endpoints.
@@ -2223,9 +3011,17 @@ async function startServer() {
     if (!connected) {
       throw new Error('Production server cannot start without an active MongoDB connection.');
     }
+    await Storage.seedFeaturedSeriesIfMissing().catch((err) =>
+      console.warn('[AI MOVIE] Featured series seed warning:', err?.message)
+    );
     registerHtmlRoutes();
   } else {
-    await connectDB();
+    try {
+      await connectDB();
+      await Storage.seedFeaturedSeriesIfMissing();
+    } catch (err: any) {
+      console.warn('[AI MOVIE] Initial MongoDB connection attempt failed (API will return 503 until connected):', err?.message);
+    }
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },

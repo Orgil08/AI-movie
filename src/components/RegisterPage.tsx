@@ -1,291 +1,361 @@
-import React, { useState } from 'react';
-import { Film, Mail, Lock, User as UserIcon, Eye, EyeOff, AlertCircle, ArrowRight, CheckCircle2, ShieldCheck } from 'lucide-react';
-import { useTranslations, useLocale } from '../i18n/I18nContext.js';
-import { getCsrfToken, readApiJson, setStoredUserId } from '../utils/api.js';
+import React, { useState, useEffect } from 'react';
+import {
+  User,
+  Mail,
+  Lock,
+  AlertCircle,
+  Loader2,
+  Eye,
+  EyeOff,
+  ArrowRight,
+  ArrowLeft,
+  ShieldCheck
+} from 'lucide-react';
+import { AuthUser } from './AuthModal.js';
+import { LanguageSwitcher } from './LanguageSwitcher.js';
+import { useLocale } from '../i18n/I18nContext.js';
 
 interface RegisterPageProps {
-  onSuccess: (user: { id: string; name: string; email: string; role?: 'user' | 'admin' }) => void;
-  onNavigateToLogin: () => void;
-  onNavigateToHome: () => void;
+  onSuccess: (user: AuthUser) => void;
+  onGoLogin?: () => void;
+  onNavigateToLogin?: () => void;
+  onGoHome?: () => void;
+  onNavigateToHome?: () => void;
 }
 
 export const RegisterPage: React.FC<RegisterPageProps> = ({
   onSuccess,
+  onGoLogin,
   onNavigateToLogin,
+  onGoHome,
   onNavigateToHome
 }) => {
   const { locale } = useLocale();
-  const tAuth = useTranslations('Auth');
-
+  const handleGoLogin = () => {
+    if (onNavigateToLogin) onNavigateToLogin();
+    else if (onGoLogin) onGoLogin();
+  };
+  const handleGoHome = () => {
+    if (onNavigateToHome) onNavigateToHome();
+    else if (onGoHome) onGoHome();
+  };
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [terms, setTerms] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [agreeTerms, setAgreeTerms] = useState(false);
+  const [csrfToken, setCsrfToken] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchCsrf = async (): Promise<string> => {
+    try {
+      const r = await fetch('/api/auth/csrf', { credentials: 'include' });
+      const d = await r.json();
+      if (d?.csrfToken) {
+        setCsrfToken(d.csrfToken);
+        return d.csrfToken;
+      }
+    } catch {
+      // ignore
+    }
+    return '';
+  };
+
+  useEffect(() => {
+    fetchCsrf();
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
 
-    // Client-side quick checks
-    if (!name.trim()) {
-      setError(tAuth('nameRequired'));
+    if (name.trim().length < 2) {
+      setError(
+        locale === 'en'
+          ? 'Name must be at least 2 characters.'
+          : 'Таны нэр хамгийн багадаа 2 тэмдэгт байх ёстой.'
+      );
       return;
     }
     if (!email.trim() || !email.includes('@')) {
-      setError(locale === 'en' ? 'Please enter a valid email address.' : 'Имэйл хаягаа зөв оруулна уу.');
+      setError(
+        locale === 'en' ? 'Please enter a valid email address.' : 'Имэйл хаягаа зөв оруулна уу.'
+      );
       return;
     }
     if (password.length < 8) {
-      setError(locale === 'en' ? 'Password must be at least 8 characters.' : 'Нууц үг хамгийн багадаа 8 тэмдэгт байх ёстой.');
+      setError(
+        locale === 'en'
+          ? 'Password must be at least 8 characters.'
+          : 'Нууц үг хамгийн багадаа 8 тэмдэгт байх ёстой.'
+      );
       return;
     }
     if (password !== confirmPassword) {
-      setError(tAuth('passwordsDoNotMatch'));
+      setError(
+        locale === 'en'
+          ? 'Password confirmation does not match.'
+          : 'Баталгаажуулах нууц үг таарахгүй байна.'
+      );
       return;
     }
-    if (!terms) {
-      setError(locale === 'en' ? 'Please agree to the Terms and Conditions.' : 'Үйлчилгээний нөхцөлийг зөвшөөрнө үү.');
+    if (!agreeTerms) {
+      setError(
+        locale === 'en'
+          ? 'Please accept the Terms of Service and Privacy Policy.'
+          : 'Үйлчилгээний нөхцөл болон нууцлалын бодлогыг зөвшөөрнө үү.'
+      );
       return;
     }
 
     setLoading(true);
-
     try {
-      const csrfToken = await getCsrfToken();
+      const activeCsrf = csrfToken || (await fetchCsrf());
       const res = await fetch('/api/auth/register', {
         method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': activeCsrf
+        },
         body: JSON.stringify({
           name: name.trim(),
-          email: email.trim(),
+          email: email.trim().toLowerCase(),
           password,
-          confirmPassword,
-          terms,
-          csrfToken
+          csrfToken: activeCsrf
         })
       });
 
-      const data = await readApiJson<{ error?: string; message?: string; user?: { id: string; name: string; email: string; role?: 'user' | 'admin' } }>(res);
+      const data = await res.json();
+      if (!res.ok || !data.user) {
+        throw new Error(
+          data.message ||
+            (locale === 'en' ? 'Registration failed.' : 'Бүртгүүлэхэд алдаа гарлаа.')
+        );
+      }
 
-      if (!res.ok) {
-        if (data.error === 'EMAIL_ALREADY_EXISTS') {
-          setError(locale === 'en' ? 'This email is already registered. Please sign in.' : 'Энэ имэйл хаяг бүртгэгдсэн байна. Нэвтэрч орно уу.');
-        } else {
-          setError(data.message || tAuth('authFailed'));
+      if (data.sessionToken) {
+        try {
+          sessionStorage.setItem('ai_movie_session_token', data.sessionToken);
+        } catch {
+          // ignore
         }
-        return;
       }
 
-      // Success: automatically log the user in and enter the app!
-      if (!data.user?.id) {
-        setError(tAuth('authFailed'));
-        return;
-      }
-      setStoredUserId(data.user.id);
       onSuccess(data.user);
     } catch (err: any) {
-      setError(err.message || tAuth('networkError'));
+      setError(
+        err.message ||
+          (locale === 'en' ? 'Registration failed.' : 'Бүртгүүлэхэд алдаа гарлаа.')
+      );
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="relative min-h-[90vh] flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
-      {/* Cinematic Ambient Glow */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute -top-40 -right-40 w-96 h-96 bg-[#e50914]/15 rounded-full blur-[120px]" />
-        <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-[#e5a93c]/15 rounded-full blur-[120px]" />
-      </div>
+    <div className="min-h-screen bg-[#080A10] text-white flex flex-col justify-between relative overflow-hidden">
+      {/* Top Bar */}
+      <header className="relative z-10 max-w-[1440px] w-full mx-auto px-4 sm:px-8 py-5 flex items-center justify-between">
+        <button
+          type="button"
+          onClick={handleGoHome}
+          className="inline-flex items-center gap-2 text-xs sm:text-sm font-semibold text-[#94A3B8] hover:text-white transition-colors cursor-pointer"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <span>{locale === 'en' ? 'Back to Home' : 'Нүүр хуудас руу буцах'}</span>
+        </button>
+        <LanguageSwitcher />
+      </header>
 
-      <div className="relative w-full max-w-md bg-[#0f172a]/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl shadow-black/80 p-7 sm:p-9 space-y-6">
-        {/* Brand Header */}
-        <div className="text-center space-y-2">
-          <button
-            onClick={onNavigateToHome}
-            className="inline-flex items-center gap-2 group cursor-pointer focus:outline-none mb-1"
-          >
-            <span className="text-2xl sm:text-3xl font-black tracking-tight text-white group-hover:text-[#e50914] transition">
-              SODON
-            </span>
-            <span className="text-xs font-bold tracking-widest text-[#e5a93c] uppercase">
-              AI MOVIE
-            </span>
-          </button>
-          <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
-            {tAuth('createYourAccount')}
-          </h2>
-          <p className="text-xs text-slate-400">
-            {tAuth('signupDesc')}
-          </p>
-        </div>
+      {/* Main Centered Registration Card matching image_19d700f3.png */}
+      <main className="relative z-10 flex-1 flex items-center justify-center px-4 py-6">
+        <div className="w-full max-w-[450px] rounded-[22px] bg-[#0D111B] border border-[#252D3A] p-7 sm:p-10 shadow-[0_25px_70px_rgba(0,0,0,0.85)]">
+          <div className="text-center mb-6">
+            <div className="inline-flex items-baseline justify-center gap-2 mb-3">
+              <span className="text-3xl font-black tracking-tight text-white">SODON</span>
+              <span className="text-sm font-extrabold tracking-[0.2em] text-[#F5B936] uppercase">
+                AI MOVIE
+              </span>
+            </div>
 
-        {/* Security Badge */}
-        <div className="flex items-center justify-center gap-1.5 py-1 px-3 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[11px] font-semibold w-fit mx-auto">
-          <ShieldCheck className="w-3.5 h-3.5" />
-          <span>{locale === 'en' ? 'Bcrypt Encrypted & Secure Auth' : 'Bcrypt нууцлалтай найдвартай бүртгэл'}</span>
-        </div>
+            <h1 className="text-2xl sm:text-[26px] font-black text-white tracking-tight">
+              {locale === 'en' ? 'Create New Account' : 'Шинэ бүртгэл үүсгэх'}
+            </h1>
+            <p className="text-xs sm:text-sm text-[#94A3B8] mt-2 leading-relaxed">
+              {locale === 'en'
+                ? 'Sign up today and stream 4K Ultra HD AI cinema'
+                : 'Өнөөдөр бүртгүүлж, 4K Ultra HD хиймэл оюунт кинонуудыг үзээрэй'}
+            </p>
 
-        {/* Error Alert */}
-        {error && (
-          <div className="p-3.5 rounded-xl bg-rose-950/40 border border-rose-500/40 flex items-start gap-2.5 text-rose-300 text-xs animate-in fade-in">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-400" />
-            <div className="space-y-1">
-              <span className="font-semibold block">{error}</span>
-              {error.includes('бүртгэгдсэн') && (
+            {/* Green Security Badge matching image_19d700f3.png */}
+            <div className="mt-4 inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#10B981]/10 border border-[#10B981]/30 text-[#10B981] text-xs font-bold">
+              <ShieldCheck className="w-4 h-4" />
+              <span>
+                {locale === 'en'
+                  ? 'Bcrypt encrypted secure account'
+                  : 'Bcrypt нууцлалтай найдвартай бүртгэл'}
+              </span>
+            </div>
+          </div>
+
+          {error && (
+            <div className="mb-5 p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5 text-xs text-red-300">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="block text-xs font-bold text-white mb-1.5">
+                {locale === 'en' ? 'Your Name' : 'Таны нэр'}
+              </label>
+              <div className="relative">
+                <User className="w-4 h-4 text-[#64748B] absolute left-4 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  required
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder={locale === 'en' ? 'e.g. Batbayar' : 'Жнь: Батбаяр'}
+                  className="w-full pl-11 pr-4 py-3.5 rounded-xl bg-[#111827] border border-[#252D3A] text-sm text-white placeholder-[#64748B] focus:outline-none focus:border-[#E50914] transition-colors"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-white mb-1.5">
+                {locale === 'en' ? 'Email Address' : 'Имэйл хаяг'}
+              </label>
+              <div className="relative">
+                <Mail className="w-4 h-4 text-[#64748B] absolute left-4 top-1/2 -translate-y-1/2" />
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="name@example.mn"
+                  className="w-full pl-11 pr-4 py-3.5 rounded-xl bg-[#111827] border border-[#252D3A] text-sm text-white placeholder-[#64748B] focus:outline-none focus:border-[#E50914] transition-colors"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-white mb-1.5">
+                {locale === 'en' ? 'Password ' : 'Нууц үг '}
+                <span className="text-[#64748B] font-normal">
+                  {locale === 'en' ? '(minimum 8 characters)' : '(хамгийн багадаа 8 тэмдэгт)'}
+                </span>
+              </label>
+              <div className="relative">
+                <Lock className="w-4 h-4 text-[#64748B] absolute left-4 top-1/2 -translate-y-1/2" />
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  required
+                  minLength={8}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full pl-11 pr-11 py-3.5 rounded-xl bg-[#111827] border border-[#252D3A] text-sm text-white placeholder-[#64748B] focus:outline-none focus:border-[#E50914] transition-colors"
+                />
                 <button
                   type="button"
-                  onClick={onNavigateToLogin}
-                  className="text-white underline font-bold cursor-pointer text-[11px]"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#64748B] hover:text-gray-300 cursor-pointer"
                 >
-                  {tAuth('alreadyHaveAccount')}
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-white mb-1.5">
+                {locale === 'en' ? 'Confirm Password' : 'Нууц үг баталгаажуулах'}
+              </label>
+              <div className="relative">
+                <Lock className="w-4 h-4 text-[#64748B] absolute left-4 top-1/2 -translate-y-1/2" />
+                <input
+                  type={showConfirmPassword ? 'text' : 'password'}
+                  required
+                  minLength={8}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full pl-11 pr-11 py-3.5 rounded-xl bg-[#111827] border border-[#252D3A] text-sm text-white placeholder-[#64748B] focus:outline-none focus:border-[#E50914] transition-colors"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#64748B] hover:text-gray-300 cursor-pointer"
+                >
+                  {showConfirmPassword ? (
+                    <EyeOff className="w-4 h-4" />
+                  ) : (
+                    <Eye className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2.5 pt-1">
+              <input
+                id="register-terms"
+                type="checkbox"
+                checked={agreeTerms}
+                onChange={(e) => setAgreeTerms(e.target.checked)}
+                className="w-4 h-4 mt-0.5 rounded border-[#252D3A] bg-[#111827] accent-[#E50914] cursor-pointer"
+              />
+              <label
+                htmlFor="register-terms"
+                className="text-xs text-[#94A3B8] leading-relaxed select-none cursor-pointer"
+              >
+                {locale === 'en'
+                  ? 'I agree to the Terms of Service and Privacy Policy'
+                  : 'Үйлчилгээний нөхцөл болон нууцлалын бодлогыг зөвшөөрч байна'}
+              </label>
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-[#E50914] to-[#C80812] hover:from-[#F5121E] hover:to-[#D60A15] text-white font-black text-sm shadow-[0_10px_28px_rgba(229,9,20,0.4)] transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            >
+              {loading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>{locale === 'en' ? 'Creating account...' : 'Бүртгэж байна...'}</span>
+                </>
+              ) : (
+                <>
+                  <span>{locale === 'en' ? 'Sign Up' : 'Бүртгүүлэх'}</span>
+                  <ArrowRight className="w-4 h-4" />
+                </>
               )}
-            </div>
-          </div>
-        )}
+            </button>
+          </form>
 
-        {/* Registration Form */}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Full Name */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              {tAuth('fullName')}
-            </label>
-            <div className="relative">
-              <UserIcon className="w-4 h-4 text-slate-500 absolute left-3 top-3.5" />
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder={tAuth('fullNamePlaceholder')}
-                required
-                className="w-full bg-[#111827] border border-white/15 rounded-xl pl-9 pr-3 py-2.5 text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus:border-[#e50914] focus:ring-1 focus:ring-[#e50914] transition"
-              />
-            </div>
-          </div>
-
-          {/* Email */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              {tAuth('emailLabel')}
-            </label>
-            <div className="relative">
-              <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-3.5" />
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder={tAuth('emailPlaceholder')}
-                required
-                className="w-full bg-[#111827] border border-white/15 rounded-xl pl-9 pr-3 py-2.5 text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus:border-[#e50914] focus:ring-1 focus:ring-[#e50914] transition"
-              />
-            </div>
-          </div>
-
-          {/* Password */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              {tAuth('passwordLabel')} <span className="text-[10px] text-slate-500 font-normal">({locale === 'en' ? 'min 8 characters' : 'хамгийн багадаа 8 тэмдэгт'})</span>
-            </label>
-            <div className="relative">
-              <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-3.5" />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder={tAuth('passwordPlaceholder')}
-                required
-                minLength={8}
-                className="w-full bg-[#111827] border border-white/15 rounded-xl pl-9 pr-10 py-2.5 text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus:border-[#e50914] focus:ring-1 focus:ring-[#e50914] transition"
-              />
+          <div className="mt-7 pt-5 border-t border-[#252D3A] text-center">
+            <p className="text-xs text-[#94A3B8]">
+              {locale === 'en' ? 'Already have an account?' : 'Бүртгэлтэй юу?'}{' '}
               <button
                 type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-3 text-slate-400 hover:text-white cursor-pointer"
-                title={showPassword ? tAuth('hidePassword') : tAuth('showPassword')}
+                onClick={handleGoLogin}
+                className="text-[#E50914] hover:text-[#FF3B45] font-bold ml-1 cursor-pointer"
               >
-                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                {locale === 'en' ? 'Sign In' : 'Нэвтрэх'}
               </button>
-            </div>
+            </p>
           </div>
-
-          {/* Confirm Password */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-              {tAuth('confirmPassword')}
-            </label>
-            <div className="relative">
-              <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-3.5" />
-              <input
-                type={showConfirmPassword ? 'text' : 'password'}
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder={tAuth('confirmPasswordPlaceholder')}
-                required
-                minLength={8}
-                className="w-full bg-[#111827] border border-white/15 rounded-xl pl-9 pr-10 py-2.5 text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus:border-[#e50914] focus:ring-1 focus:ring-[#e50914] transition"
-              />
-              <button
-                type="button"
-                onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-                className="absolute right-3 top-3 text-slate-400 hover:text-white cursor-pointer"
-                title={showConfirmPassword ? tAuth('hidePassword') : tAuth('showPassword')}
-              >
-                {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-          </div>
-
-          {/* Terms & Conditions Checkbox */}
-          <div className="flex items-start">
-            <input
-              id="terms-checkbox"
-              type="checkbox"
-              checked={terms}
-              onChange={(e) => setTerms(e.target.checked)}
-              required
-              className="mt-0.5 w-4 h-4 rounded bg-[#111827] border-white/20 text-[#e50914] focus:ring-[#e50914] cursor-pointer shrink-0"
-            />
-            <label htmlFor="terms-checkbox" className="ml-2 text-xs text-slate-400 cursor-pointer select-none leading-relaxed">
-              {tAuth('termsAgreement')}
-            </label>
-          </div>
-
-          {/* Submit Button */}
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full py-3 px-4 bg-gradient-to-r from-[#e50914] to-[#b81d24] hover:from-[#f40612] hover:to-[#e50914] text-white font-black rounded-xl text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-rose-950/50 cursor-pointer transition disabled:opacity-50"
-          >
-            {loading ? (
-              <span className="animate-pulse">{tAuth('processing')}</span>
-            ) : (
-              <>
-                <span>{tAuth('signUpButton')}</span>
-                <ArrowRight className="w-4 h-4" />
-              </>
-            )}
-          </button>
-        </form>
-
-        {/* Link to Sign In */}
-        <div className="pt-2 text-center text-xs text-slate-400 border-t border-white/10">
-          <span>{locale === 'en' ? 'Already have an account? ' : 'Бүртгэлтэй юу? '}</span>
-          <button
-            onClick={onNavigateToLogin}
-            className="text-[#e50914] hover:underline font-bold cursor-pointer ml-1"
-          >
-            {tAuth('signInButton')}
-          </button>
         </div>
-      </div>
+      </main>
+
+      <footer className="relative z-10 text-center py-5 text-xs text-[#64748B]">
+        © {new Date().getFullYear()} SODON AI MOVIE. Бүх эрх хуулиар хамгаалагдсан.
+      </footer>
     </div>
   );
 };

@@ -27,6 +27,9 @@ export interface IPayment {
   verifiedAt?: Date;
   previousStatus?: PaymentStatus;
   rejectionReason?: string;
+  seriesId?: string;
+  accessType?: 'subscription' | 'rental' | 'permanent';
+  rentalDurationHours?: number;
 }
 
 export interface ISubscription {
@@ -81,6 +84,7 @@ export interface IMovie {
   // Backward-compatible fields
   titleMn?: string;
   titleEn?: string;
+  originalTitle?: string;
   synopsisMn?: string;
   synopsisEn?: string;
   descriptionMn?: string;
@@ -93,6 +97,7 @@ export interface IMovie {
   videoSource?: string;
   trailerUrl: string;
   year: number;
+  country?: string;
   duration: string;
   genres: string[];
   genre?: { mn: string; en: string };
@@ -117,8 +122,68 @@ export interface IMovie {
   published: boolean;
   viewsCount?: number;
   tags?: string[];
+  // TV Series & Monetization fields
+  hasMongolianSubtitles?: boolean;
+  isOriginal?: boolean;
+  isExclusive?: boolean;
+  isShortDrama?: boolean;
+  totalEpisodes?: number;
+  freeEpisodes?: number;
+  unlockPrice?: number;
+  rentalDurationHours?: number;
+  vipEnabled?: boolean;
+  seriesStatus?: 'ongoing' | 'completed' | 'draft';
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface IEpisode {
+  id: string;
+  seriesId: string;
+  episodeNumber: number;
+  title: string;
+  titleEn?: string;
+  description?: string;
+  thumbnailUrl?: string;
+  subtitleUrlMn?: string;
+  videoUrl: string;
+  duration: string;
+  isPublished: boolean;
+  published?: boolean;
+  isFree: boolean;
+  order?: number;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export interface ISeriesPurchase {
+  id?: string;
+  userId: string;
+  seriesId: string;
+  orderNumber: string;
+  amount: number;
+  currency?: string;
+  paymentId?: string;
+  status?: string;
+  accessType: 'rental' | 'permanent';
+  paymentProvider?: PaymentMethod;
+  paymentReference?: string;
+  paymentStatus?: PaymentStatus;
+  expiresAt: Date | null;
+  purchasedAt: Date;
+}
+
+export interface IUserPlaybackProgress {
+  id?: string;
+  userId: string;
+  movieId: string;
+  episodeId?: string;
+  episodeNumber: number;
+  currentTime?: number;
+  playbackPosition?: number;
+  duration: number;
+  completed: boolean;
+  lastWatchedAt: Date;
 }
 
 export interface ICategory {
@@ -205,6 +270,7 @@ export const MovieSchema = new Schema<IMovie & Document>(
     },
     titleMn: { type: String },
     titleEn: { type: String },
+    originalTitle: { type: String },
     synopsisMn: { type: String },
     synopsisEn: { type: String },
     descriptionMn: { type: String },
@@ -217,6 +283,7 @@ export const MovieSchema = new Schema<IMovie & Document>(
     videoSource: { type: String },
     trailerUrl: { type: String, default: '' },
     year: { type: Number, required: true },
+    country: { type: String, default: 'Монгол' },
     duration: { type: String, required: true },
     genres: { type: [String], default: [] },
     genreMn: { type: String },
@@ -245,10 +312,73 @@ export const MovieSchema = new Schema<IMovie & Document>(
     minPlan: { type: String, enum: ['basic', 'standard', 'premium'], default: 'basic' },
     published: { type: Boolean, default: true, index: true },
     viewsCount: { type: Number, default: 0 },
-    tags: { type: [String], default: [] }
+    tags: { type: [String], default: [] },
+    hasMongolianSubtitles: { type: Boolean, default: true },
+    isOriginal: { type: Boolean, default: false },
+    isExclusive: { type: Boolean, default: false },
+    isShortDrama: { type: Boolean, default: false },
+    totalEpisodes: { type: Number, default: 1 },
+    freeEpisodes: { type: Number, default: 1 },
+    unlockPrice: { type: Number, default: 4900 },
+    rentalDurationHours: { type: Number, default: 72 },
+    vipEnabled: { type: Boolean, default: true },
+    seriesStatus: { type: String, enum: ['ongoing', 'completed', 'draft'], default: 'ongoing' }
   },
   { timestamps: true }
 );
+
+export const EpisodeSchema = new Schema<IEpisode & Document>(
+  {
+    id: { type: String, required: true, unique: true, index: true },
+    seriesId: { type: String, required: true, index: true },
+    episodeNumber: { type: Number, required: true },
+    title: { type: String, required: true },
+    description: { type: String, default: '' },
+    thumbnailUrl: { type: String, default: '' },
+    videoUrl: { type: String, required: true },
+    duration: { type: String, default: '2 мин' },
+    isPublished: { type: Boolean, default: true },
+    isFree: { type: Boolean, default: false }
+  },
+  { timestamps: true }
+);
+EpisodeSchema.index({ seriesId: 1, episodeNumber: 1 }, { unique: true });
+
+export const SeriesPurchaseSchema = new Schema<ISeriesPurchase & Document>(
+  {
+    userId: { type: String, required: true, index: true },
+    seriesId: { type: String, required: true, index: true },
+    orderNumber: { type: String, required: true, index: true },
+    amount: { type: Number, required: true },
+    accessType: { type: String, enum: ['rental', 'permanent'], default: 'rental' },
+    paymentProvider: { type: String, enum: ['wire_qpay', 'bank_transfer'], default: 'wire_qpay' },
+    paymentReference: { type: String, required: true },
+    paymentStatus: {
+      type: String,
+      enum: ['PENDING', 'PENDING_REVIEW', 'PAID', 'REJECTED', 'EXPIRED', 'FAILED'],
+      default: 'PAID',
+      index: true
+    },
+    expiresAt: { type: Date, default: null, index: true },
+    purchasedAt: { type: Date, default: () => new Date() }
+  },
+  { timestamps: true }
+);
+
+export const UserPlaybackProgressSchema = new Schema<IUserPlaybackProgress & Document>(
+  {
+    userId: { type: String, required: true, index: true },
+    movieId: { type: String, required: true, index: true },
+    episodeId: { type: String, default: '' },
+    episodeNumber: { type: Number, default: 1 },
+    playbackPosition: { type: Number, default: 0 },
+    duration: { type: Number, default: 0 },
+    completed: { type: Boolean, default: false },
+    lastWatchedAt: { type: Date, default: () => new Date(), index: true }
+  },
+  { timestamps: true }
+);
+UserPlaybackProgressSchema.index({ userId: 1, movieId: 1, episodeNumber: 1 }, { unique: true });
 
 export const CategorySchema = new Schema<ICategory & Document>(
   {
@@ -300,7 +430,10 @@ export const PaymentSchema = new Schema<IPayment & Document>(
     verifiedByAdminEmail: { type: String, default: null },
     verifiedAt: { type: Date, default: null },
     previousStatus: { type: String, default: null },
-    rejectionReason: { type: String, default: null }
+    rejectionReason: { type: String, default: null },
+    seriesId: { type: String, default: null, index: true },
+    accessType: { type: String, enum: ['subscription', 'rental', 'permanent'], default: 'subscription' },
+    rentalDurationHours: { type: Number, default: null }
   },
   { timestamps: { createdAt: true, updatedAt: false } }
 );
@@ -352,13 +485,13 @@ export const WebsiteSettingsSchema = new Schema<IWebsiteSettings & Document>(
     taglineMn: { type: String, default: 'Киноны Дараагийн Үе' },
     taglineEn: { type: String, default: 'Next-Gen AI Cinema' },
     featuredMovieId: { type: String, default: '' },
-    announcementMn: { type: String, default: 'AI Кино платформд тавтай морилно уу.' },
-    announcementEn: { type: String, default: 'Welcome to AI Movie streaming platform.' },
+    announcementMn: { type: String, default: '' },
+    announcementEn: { type: String, default: '' },
     maintenanceMode: { type: Boolean, default: false },
     allowRegistrations: { type: Boolean, default: true },
     primaryCurrency: { type: String, default: 'MNT' },
     defaultLocale: { type: String, enum: ['mn', 'en'], default: 'mn' },
-    contactEmail: { type: String, default: 'support@aimovie.mn' },
+    contactEmail: { type: String, default: 'gantomor6174@gmail.com' },
     contactPhone: { type: String, default: '+976 7711-2099' },
     streamingQualityDefault: { type: String, default: '4K HDR' },
     bankTransferEnabled: { type: Boolean, default: true },
@@ -390,6 +523,17 @@ export const UserModel =
 export const MovieModel =
   mongoose.models.Movie || mongoose.model<IMovie & Document>('Movie', MovieSchema);
 
+export const EpisodeModel =
+  mongoose.models.Episode || mongoose.model<IEpisode & Document>('Episode', EpisodeSchema);
+
+export const SeriesPurchaseModel =
+  mongoose.models.SeriesPurchase ||
+  mongoose.model<ISeriesPurchase & Document>('SeriesPurchase', SeriesPurchaseSchema);
+
+export const UserPlaybackProgressModel =
+  mongoose.models.UserPlaybackProgress ||
+  mongoose.model<IUserPlaybackProgress & Document>('UserPlaybackProgress', UserPlaybackProgressSchema);
+
 export const CategoryModel =
   mongoose.models.Category || mongoose.model<ICategory & Document>('Category', CategorySchema);
 
@@ -414,3 +558,4 @@ export const PasswordResetTokenModel =
 export const WebsiteSettingsModel =
   mongoose.models.WebsiteSettings ||
   mongoose.model<IWebsiteSettings & Document>('WebsiteSettings', WebsiteSettingsSchema);
+

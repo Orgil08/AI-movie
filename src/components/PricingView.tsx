@@ -4,6 +4,9 @@ import { SUBSCRIPTION_PLANS } from '../config/subscription-plans.js';
 import { BANK_TRANSFER_DETAILS } from '../config/bank-details.js';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
 import { formatCurrency } from '../i18n/types.js';
+import { copyTextToClipboard } from '../utils/api.js';
+
+const PAYMENT_METHOD_STORAGE_KEY = 'ai_movie_payment_method';
 
 interface PricingViewProps {
   currentSubscription: any;
@@ -18,21 +21,40 @@ export const PricingView: React.FC<PricingViewProps> = ({
 }) => {
   const t = useTranslations('Pricing');
   const { locale } = useLocale();
-  const [selectedMethod, setSelectedMethod] = useState<'wire_qpay' | 'bank_transfer'>('wire_qpay');
+  const [selectedMethod, setSelectedMethodState] = useState<'wire_qpay' | 'bank_transfer'>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem(PAYMENT_METHOD_STORAGE_KEY);
+        if (saved === 'bank_transfer' || saved === 'wire_qpay') {
+          return saved;
+        }
+      } catch {}
+    }
+    return 'wire_qpay';
+  });
   const [copiedAccount, setCopiedAccount] = useState(false);
+
+  const setSelectedMethod = (method: 'wire_qpay' | 'bank_transfer') => {
+    setSelectedMethodState(method);
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(PAYMENT_METHOD_STORAGE_KEY, method);
+      } catch {}
+    }
+  };
 
   const plans = Object.values(SUBSCRIPTION_PLANS);
   const bankPartners = BANK_TRANSFER_DETAILS.supportedBanks;
 
-  const handleCopyAccount = (e: React.MouseEvent) => {
+  const handleCopyAccount = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(BANK_TRANSFER_DETAILS.accountNumber);
+    await copyTextToClipboard(BANK_TRANSFER_DETAILS.accountNumber);
     setCopiedAccount(true);
     setTimeout(() => setCopiedAccount(false), 2000);
   };
 
   return (
-    <div className="py-14 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1600px] mx-auto select-none">
+    <div className="py-14 px-4 sm:px-8 md:px-12 lg:px-16 xl:px-20 w-full max-w-[1600px] mx-auto">
       {/* Header */}
       <div className="text-center max-w-3xl mx-auto space-y-4">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-md text-xs font-black uppercase tracking-wider bg-[#e5a93c]/15 text-[#e5a93c] border border-[#e5a93c]/30">
@@ -55,6 +77,7 @@ export const PricingView: React.FC<PricingViewProps> = ({
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-1.5 bg-[#111827] rounded-2xl border border-white/10">
             <button
+              type="button"
               onClick={() => setSelectedMethod('wire_qpay')}
               className={`p-3.5 rounded-xl flex items-center gap-3 transition cursor-pointer text-left ${
                 selectedMethod === 'wire_qpay'
@@ -77,6 +100,7 @@ export const PricingView: React.FC<PricingViewProps> = ({
             </button>
 
             <button
+              type="button"
               onClick={() => setSelectedMethod('bank_transfer')}
               className={`p-3.5 rounded-xl flex items-center gap-3 transition cursor-pointer text-left ${
                 selectedMethod === 'bank_transfer'
@@ -101,11 +125,11 @@ export const PricingView: React.FC<PricingViewProps> = ({
 
           {/* Quick Bank Account Banner if Bank Transfer selected */}
           {selectedMethod === 'bank_transfer' && (
-            <div className="mt-3 p-3.5 rounded-xl bg-amber-950/30 border border-amber-700/40 text-left text-xs text-amber-200/90 flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in">
+            <div className="mt-3 p-3.5 rounded-xl bg-amber-950/30 border border-amber-700/40 text-left text-xs text-amber-200/90 flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in select-text">
               <div className="space-y-0.5">
                 <div className="font-bold text-white flex items-center gap-1.5">
                   <Building2 className="w-4 h-4 text-[#e5a93c]" />
-                  <span>{BANK_TRANSFER_DETAILS.bankName}: {BANK_TRANSFER_DETAILS.accountNumber}</span>
+                  <span>{BANK_TRANSFER_DETAILS.bankName}: <span className="font-mono text-[#e5a93c]">{BANK_TRANSFER_DETAILS.accountNumber}</span></span>
                 </div>
                 <div className="text-[11px] text-amber-300/80">
                   {locale === 'en' ? 'Account Holder:' : 'Эзэмшигч:'}{' '}
@@ -113,6 +137,7 @@ export const PricingView: React.FC<PricingViewProps> = ({
                 </div>
               </div>
               <button
+                type="button"
                 onClick={handleCopyAccount}
                 className="px-3 py-1.5 rounded-lg bg-[#e5a93c]/20 hover:bg-[#e5a93c]/30 text-[#e5a93c] font-semibold text-xs flex items-center gap-1.5 border border-[#e5a93c]/40 transition self-start sm:self-auto cursor-pointer"
               >

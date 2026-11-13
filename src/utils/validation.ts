@@ -47,6 +47,7 @@ export const loginSchema = z.object({
 export const movieSchema = z.object({
   titleMn: z.string().trim().min(1, { message: 'Монгол гарчиг оруулна уу.' }),
   titleEn: z.string().trim().min(1, { message: 'English title is required.' }),
+  originalTitle: z.string().trim().optional().default(''),
   slug: z
     .string()
     .trim()
@@ -59,6 +60,7 @@ export const movieSchema = z.object({
   videoUrl: z.string().trim().min(1, { message: 'Видео тоглуулах эх сурвалж оруулна уу.' }),
   trailerUrl: z.string().trim().optional().default(''),
   year: z.coerce.number().int().min(1900).max(2100),
+  country: z.string().trim().optional().default('Монгол'),
   duration: z.string().trim().min(1, { message: 'Үргэлжлэх хугацаа оруулна уу (жишээ: 2h 15m).' }),
   genres: z.array(z.string()).min(1, { message: 'Хамгийн багадаа 1 төрөл сонгоно уу.' }),
   rating: z.string().trim().default('8.5'),
@@ -71,9 +73,20 @@ export const movieSchema = z.object({
   language: z.string().trim().default('mn'),
   type: z.enum(['movie', 'series']).default('movie'),
   featured: z.boolean().default(false),
+  trending: z.boolean().optional().default(false),
   isPremium: z.boolean().default(true),
   minPlan: z.enum(['basic', 'standard', 'premium']).default('basic'),
-  published: z.boolean().default(true)
+  published: z.boolean().default(true),
+  hasMongolianSubtitles: z.boolean().optional().default(true),
+  isOriginal: z.boolean().optional().default(false),
+  isExclusive: z.boolean().optional().default(false),
+  isShortDrama: z.boolean().optional().default(false),
+  totalEpisodes: z.coerce.number().int().min(1).max(500).optional().default(1),
+  freeEpisodes: z.coerce.number().int().min(0).max(500).optional().default(1),
+  unlockPrice: z.coerce.number().min(0).optional().default(4900),
+  rentalDurationHours: z.coerce.number().int().min(1).optional().default(72),
+  vipEnabled: z.boolean().optional().default(true),
+  seriesStatus: z.enum(['ongoing', 'completed', 'draft']).optional().default('ongoing')
 });
 
 export const categorySchema = z.object({

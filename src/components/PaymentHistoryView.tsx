@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { History, CheckCircle2, Clock, XCircle, RefreshCw } from 'lucide-react';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
 import { formatCurrency, formatDate } from '../i18n/types.js';
+import { authFetch } from '../utils/api.js';
 
 interface PaymentHistoryViewProps {
   onRenewPlan: () => void;
@@ -19,7 +20,7 @@ export const PaymentHistoryView: React.FC<PaymentHistoryViewProps> = ({ onRenewP
   const fetchHistory = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/payments/history');
+      const res = await authFetch('/api/payments/history');
       if (!res.ok) throw new Error('Failed to fetch payment history');
       const data = await res.json();
       setPayments(data.payments || []);

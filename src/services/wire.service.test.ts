@@ -218,7 +218,7 @@ test('BankTransfer - Configuration contains exact account 5132104221 and sukhbat
   assert.ok(BANK_TRANSFER_DETAILS.bankName.includes('Хаан'));
 });
 
-test('BankTransfer - Payment order and confirmation activates user subscription', async () => {
+test('BankTransfer - User confirmation keeps payment PENDING_REVIEW until Admin verification activates subscription', async () => {
   memDb.clear();
 
   const userId = 'user_bank_test';
@@ -239,29 +239,36 @@ test('BankTransfer - Payment order and confirmation activates user subscription'
   assert.equal(order.status, 'PENDING');
   assert.equal(order.paymentMethod, 'bank_transfer');
 
-  // 2. Confirm bank transfer
-  const updated = await Storage.updatePaymentStatus(orderNumber, 'PAID', {
-    paidAt: new Date(),
-    bankSenderName: 'Сүхбат Мөнх-Оргил',
-    bankTransferRef: 'TXN-998877'
-  });
-
-  assert.equal(updated?.status, 'PAID');
-  assert.equal(updated?.bankSenderName, 'Сүхбат Мөнх-Оргил');
-  assert.equal(updated?.bankTransferRef, 'TXN-998877');
-
-  // 3. Activate subscription
-  const sub = await Storage.activateSubscription({
+  // 2. User submits bank transfer confirmation -> must stay PENDING_REVIEW (never self-approved to PAID)
+  const submitted = await Storage.submitBankTransferForReview({
+    orderNumber,
     userId,
-    planId: order.planId,
-    paymentId: orderNumber,
-    durationDays: 30
+    senderName: 'Сүхбат Мөнх-Оргил',
+    transferRef: 'TXN-998877'
   });
 
-  assert.equal(sub.status, 'ACTIVE');
-  assert.equal(sub.planId, 'premium');
+  assert.equal(submitted.status, 'PENDING_REVIEW');
+  assert.equal(submitted.bankSenderName, 'Сүхбат Мөнх-Оргил');
+  assert.equal(submitted.bankTransferRef, 'TXN-998877');
+
+  // Subscription must NOT be active before administrator verification
+  const subBeforeAdmin = await Storage.getActiveSubscription(userId);
+  assert.equal(subBeforeAdmin, null);
+
+  // 3. Administrator explicitly verifies & approves the bank transfer
+  const approved = await Storage.approveBankTransferPayment({
+    idOrOrderNumber: orderNumber,
+    adminId: 'admin_verifier_1',
+    adminEmail: 'admin@sodon.mn'
+  });
+
+  assert.equal(approved.payment.status, 'PAID');
+  assert.equal(approved.payment.verifiedByAdminId, 'admin_verifier_1');
+  assert.equal(approved.subscription.status, 'ACTIVE');
+  assert.equal(approved.subscription.planId, 'premium');
 
   const activeSub = await Storage.getActiveSubscription(userId);
   assert.ok(activeSub);
   assert.equal(activeSub?.planId, 'premium');
 });
+

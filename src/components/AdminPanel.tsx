@@ -28,12 +28,14 @@ import {
   UserCheck,
   UserX,
   Calendar,
-  DollarSign
+  DollarSign,
+  Layers
 } from 'lucide-react';
 import { useTranslations, useLocale } from '../i18n/I18nContext.js';
 import { formatCurrency, formatDate } from '../i18n/types.js';
 import { LanguageSwitcher } from './LanguageSwitcher.js';
 import { authFetch } from '../utils/api.js';
+import { calculatePaidStartingEpisode, mergeGeneratedEpisodes, EpisodeItem } from '../utils/seriesEpisodes.js';
 
 interface AdminPanelProps {
   currentUser: { id: string; name: string; email: string; role?: 'user' | 'admin' } | null;
@@ -98,6 +100,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [formData, setFormData] = useState({
     titleMn: '',
     titleEn: '',
+    originalTitle: '',
     slug: '',
     synopsisMn: '',
     synopsisEn: '',
@@ -106,6 +109,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     videoUrl: '',
     trailerUrl: '',
     year: new Date().getFullYear(),
+    country: 'Монгол',
     duration: '2h 00m',
     genres: ['Sci-Fi'],
     rating: '9.0',
@@ -117,11 +121,28 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     castEn: '',
     language: 'mn',
     type: 'movie' as 'movie' | 'series',
+    hasMongolianSubtitles: true,
+    isOriginal: false,
+    isExclusive: false,
+    isShortDrama: false,
+    totalEpisodes: 50,
+    freeEpisodes: 6,
+    unlockPrice: 4900,
+    rentalDurationHours: 72,
+    vipEnabled: true,
+    seriesStatus: 'completed' as 'ongoing' | 'completed',
     featured: false,
     isPremium: true,
     minPlan: 'basic' as 'basic' | 'standard' | 'premium',
     published: true
   });
+
+  // Bulk Episode Manager modal state
+  const [episodeManagerMovie, setEpisodeManagerMovie] = useState<any | null>(null);
+  const [episodesList, setEpisodesList] = useState<EpisodeItem[]>([]);
+  const [episodesLoading, setEpisodesLoading] = useState(false);
+  const [episodesSaving, setEpisodesSaving] = useState(false);
+  const [episodePageIdx, setEpisodePageIdx] = useState(0);
 
   // Category form state
   const [newCatSlug, setNewCatSlug] = useState('');
@@ -449,6 +470,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setFormData({
       titleMn: movie.titleMn || movie.title?.mn || '',
       titleEn: movie.titleEn || movie.title?.en || '',
+      originalTitle: movie.originalTitle || movie.titleEn || movie.title?.en || '',
       slug: movie.slug || movie.id,
       synopsisMn: movie.synopsisMn || movie.descriptionMn || movie.synopsis?.mn || '',
       synopsisEn: movie.synopsisEn || movie.descriptionEn || movie.synopsis?.en || '',
@@ -457,6 +479,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       videoUrl: movie.videoUrl || movie.videoSource || '',
       trailerUrl: movie.trailerUrl || '',
       year: movie.year || 2026,
+      country: movie.country || 'Монгол',
       duration: movie.duration || '2h 00m',
       genres: Array.isArray(movie.genres) && movie.genres.length > 0 ? movie.genres : ['Sci-Fi'],
       rating: movie.rating || '9.0',
@@ -468,12 +491,89 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       castEn: movie.castEn || movie.cast?.en || '',
       language: movie.language || 'mn',
       type: movie.type || 'movie',
+      hasMongolianSubtitles: movie.hasMongolianSubtitles !== false,
+      isOriginal: Boolean(movie.isOriginal),
+      isExclusive: Boolean(movie.isExclusive),
+      isShortDrama: Boolean(movie.isShortDrama),
+      totalEpisodes: Number(movie.totalEpisodes || 50),
+      freeEpisodes: Number(movie.freeEpisodes ?? 6),
+      unlockPrice: Number(movie.unlockPrice || 4900),
+      rentalDurationHours: Number(movie.rentalDurationHours || 72),
+      vipEnabled: movie.vipEnabled !== false,
+      seriesStatus: movie.seriesStatus === 'ongoing' ? 'ongoing' : 'completed',
       featured: Boolean(movie.featured),
       isPremium: movie.isPremium !== false,
       minPlan: movie.minPlan || 'basic',
       published: movie.published !== false
     });
     setActiveSection('edit-movie');
+  };
+
+  // Open Bulk Episode Manager for a TV Series
+  const handleOpenEpisodeManager = async (movie: any) => {
+    setEpisodeManagerMovie(movie);
+    setEpisodePageIdx(0);
+    setEpisodesLoading(true);
+    try {
+      const res = await authFetch(`/api/admin/movies/${movie.id}/episodes`);
+      if (res.ok) {
+        const data = await res.json();
+        setEpisodesList(Array.isArray(data.episodes) ? data.episodes : []);
+      }
+    } catch (e) {
+      notify('error', 'Ангиудын жагсаалт ачаалахад алдаа гарлаа.');
+    } finally {
+      setEpisodesLoading(false);
+    }
+  };
+
+  const handleAutoGenerateEpisodesInEditor = () => {
+    if (!episodeManagerMovie) return;
+    const total = Math.max(1, Number(episodeManagerMovie.totalEpisodes || 50));
+    const freeCount = Math.max(0, Number(episodeManagerMovie.freeEpisodes ?? 6));
+    const merged = mergeGeneratedEpisodes({
+      seriesId: episodeManagerMovie.id,
+      existingEpisodes: episodesList,
+      totalEpisodes: total,
+      freeEpisodes: freeCount,
+      defaultDuration: '2 мин',
+      defaultThumbnailUrl: episodeManagerMovie.posterUrl || episodeManagerMovie.backdropUrl || '',
+      defaultVideoUrl: episodeManagerMovie.videoUrl || ''
+    });
+    setEpisodesList(merged);
+    notify('success', `Нийт ${total} анги (эхний ${freeCount} анги үнэгүй) үүсгэгдлээ.`);
+  };
+
+  const handleSaveBulkEpisodes = async () => {
+    if (!episodeManagerMovie) return;
+    setEpisodesSaving(true);
+    try {
+      const res = await authFetch(`/api/admin/movies/${episodeManagerMovie.id}/episodes/bulk`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          totalEpisodes: episodeManagerMovie.totalEpisodes || episodesList.length,
+          freeEpisodes: episodeManagerMovie.freeEpisodes ?? 6,
+          unlockPrice: episodeManagerMovie.unlockPrice || 4900,
+          rentalDurationHours: episodeManagerMovie.rentalDurationHours || 72,
+          vipEnabled: episodeManagerMovie.vipEnabled !== false,
+          episodes: episodesList
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        notify('error', data.message || 'Ангиуд хадгалахад алдаа гарлаа.');
+        return;
+      }
+      setEpisodesList(Array.isArray(data.episodes) ? data.episodes : episodesList);
+      notify('success', data.message || 'Ангиуд амжилттай хадгалагдлаа.');
+      await fetchMovies();
+      setEpisodeManagerMovie(null);
+    } catch (err: any) {
+      notify('error', err.message || 'Сүлжээний алдаа.');
+    } finally {
+      setEpisodesSaving(false);
+    }
   };
 
   // Category Add
@@ -1187,6 +1287,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     setFormData({
                       titleMn: '',
                       titleEn: '',
+                      originalTitle: '',
                       slug: '',
                       synopsisMn: '',
                       synopsisEn: '',
@@ -1195,6 +1296,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       videoUrl: '',
                       trailerUrl: '',
                       year: new Date().getFullYear(),
+                      country: 'Монгол',
                       duration: '2h 00m',
                       genres: ['Sci-Fi'],
                       rating: '9.0',
@@ -1206,6 +1308,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       castEn: '',
                       language: 'mn',
                       type: 'movie',
+                      hasMongolianSubtitles: true,
+                      isOriginal: false,
+                      isExclusive: false,
+                      isShortDrama: false,
+                      totalEpisodes: 50,
+                      freeEpisodes: 6,
+                      unlockPrice: 4900,
+                      rentalDurationHours: 72,
+                      vipEnabled: true,
+                      seriesStatus: 'completed',
                       featured: false,
                       isPremium: true,
                       minPlan: 'basic',
@@ -1278,12 +1390,29 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                           </div>
                         </td>
                         <td className="py-3 px-4">
-                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#e5a93c]/20 text-[#e5a93c] uppercase">
-                            {m.minPlan || 'basic'}
-                          </span>
+                          <div className="space-y-1">
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#e5a93c]/20 text-[#e5a93c] uppercase">
+                              {m.minPlan || 'basic'}
+                            </span>
+                            {m.type === 'series' && (
+                              <div className="text-[10px] text-[#347DFF] font-bold">
+                                Цуврал · {m.totalEpisodes || 50} анги ({m.freeEpisodes ?? 6} үнэгүй)
+                              </div>
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 px-4 text-right">
                           <div className="flex items-center justify-end gap-1.5">
+                            {m.type === 'series' && (
+                              <button
+                                onClick={() => handleOpenEpisodeManager(m)}
+                                className="px-2.5 py-1.5 rounded-lg bg-[#1764F5]/20 hover:bg-[#1764F5]/30 border border-[#1764F5]/40 text-[#347DFF] font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+                                title="Ангиуд удирдах"
+                              >
+                                <Layers className="w-3.5 h-3.5" />
+                                <span>Ангиуд ({m.totalEpisodes || 50})</span>
+                              </button>
+                            )}
                             <button
                               onClick={() => handleTogglePublish(m.id)}
                               className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white"
@@ -1641,7 +1770,44 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 </div>
 
                 {/* Plan Requirement & Movie Type */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                  <div>
+                    <label className="block text-slate-400 mb-1">Контентын төрөл (Single Movie / TV Series)</label>
+                    <select
+                      value={formData.type}
+                      onChange={(e) => setFormData({ ...formData, type: e.target.value as any })}
+                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-[#1764F5]/50 text-white font-bold"
+                    >
+                      <option value="movie">🎬 Бүрэн хэмжээний Кино (Single Movie)</option>
+                      <option value="series">📺 Олон ангит Цуврал (TV Series)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-400 mb-1">Бүтээсэн улс (Country)</label>
+                    <input
+                      type="text"
+                      value={formData.country}
+                      onChange={(e) => setFormData({ ...formData, country: e.target.value })}
+                      placeholder="Жишээ: Монгол, Хятад, Өмнөд Солонгос"
+                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-400 mb-1">Насны ангилал (Age Rating)</label>
+                    <select
+                      value={formData.ageRating}
+                      onChange={(e) => setFormData({ ...formData, ageRating: e.target.value })}
+                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
+                    >
+                      <option value="Бүх нас">Бүх нас</option>
+                      <option value="13+">13+</option>
+                      <option value="16+">16+</option>
+                      <option value="18+">18+ (Hot+)</option>
+                    </select>
+                  </div>
+
                   <div>
                     <label className="block text-slate-400 mb-1">{tAdmin('minPlan')}</label>
                     <select
@@ -1654,51 +1820,196 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                       <option value="premium">Premium (19,900₮)</option>
                     </select>
                   </div>
+                </div>
 
-                  <div>
-                    <label className="block text-slate-400 mb-1">Бүтээлийн төрөл</label>
-                    <select
-                      value={formData.type}
-                      onChange={(e) => setFormData({ ...formData, type: e.target.value as any })}
-                      className="w-full px-3 py-2 rounded-lg bg-[#111827] border border-white/15 text-white"
-                    >
-                      <option value="movie">Бүрэн хэмжээний Кино (Movie)</option>
-                      <option value="series">Олон ангит Цуврал (Series)</option>
-                    </select>
+                {/* TV Series Episode & Monetization Configuration Box (Part 7 & Part 9) */}
+                {formData.type === 'series' && (
+                  <div className="p-5 rounded-2xl bg-[#10131D] border border-[#1764F5]/40 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+                      <div>
+                        <h4 className="text-sm font-black text-white flex items-center gap-2">
+                          <Layers className="w-4 h-4 text-[#347DFF]" />
+                          <span>Олон ангит цувралын тохиргоо ба Үнийн бодлого (TV Series & Episode Pricing)</span>
+                        </h4>
+                        <p className="text-[11px] text-[#9CA3AF] mt-0.5">
+                          Нийт ангийн тоо болон үнэгүй ангийн тоог оруулахад төлбөртэй эхлэх анги автоматаар тооцоологдоно.
+                        </p>
+                      </div>
+                      {selectedMovieForEdit && (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenEpisodeManager({ ...selectedMovieForEdit, ...formData })}
+                          className="px-3.5 py-2 rounded-xl bg-[#1764F5] hover:bg-[#347DFF] text-white font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Layers className="w-3.5 h-3.5" />
+                          <span>Ангиуд удирдах ({formData.totalEpisodes} анги)</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5">
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-300 mb-1">Нийт ангийн тоо</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={500}
+                          value={formData.totalEpisodes}
+                          onChange={(e) => {
+                            const total = Math.max(1, Number(e.target.value) || 1);
+                            setFormData({
+                              ...formData,
+                              totalEpisodes: total,
+                              freeEpisodes: Math.min(formData.freeEpisodes, total)
+                            });
+                          }}
+                          className="w-full px-3 py-2 rounded-lg bg-[#080A10] border border-white/15 text-white font-bold"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-emerald-400 mb-1">Үнэгүй ангийн тоо</label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={formData.totalEpisodes}
+                          value={formData.freeEpisodes}
+                          onChange={(e) => {
+                            const free = Math.max(0, Math.min(formData.totalEpisodes, Number(e.target.value) || 0));
+                            setFormData({ ...formData, freeEpisodes: free });
+                          }}
+                          className="w-full px-3 py-2 rounded-lg bg-[#080A10] border border-emerald-500/40 text-emerald-300 font-bold"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-[#347DFF] mb-1">Төлбөртэй эхлэх анги</label>
+                        <div className="w-full px-3 py-2 rounded-lg bg-[#1764F5]/15 border border-[#1764F5]/40 text-white font-black">
+                          {calculatePaidStartingEpisode(formData.totalEpisodes, formData.freeEpisodes)
+                            ? `${calculatePaidStartingEpisode(formData.totalEpisodes, formData.freeEpisodes)}-р ангиас`
+                            : 'Бүх анги үнэгүй'}
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-[#E8B94F] mb-1">Түрээслэх үнэ (₮)</label>
+                        <input
+                          type="number"
+                          min={0}
+                          step={100}
+                          value={formData.unlockPrice}
+                          onChange={(e) => setFormData({ ...formData, unlockPrice: Math.max(0, Number(e.target.value) || 0) })}
+                          className="w-full px-3 py-2 rounded-lg bg-[#080A10] border border-[#E8B94F]/40 text-[#E8B94F] font-bold"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-300 mb-1">Түрээсийн хугацаа (цаг)</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={formData.rentalDurationHours}
+                          onChange={(e) => setFormData({ ...formData, rentalDurationHours: Math.max(1, Number(e.target.value) || 72) })}
+                          className="w-full px-3 py-2 rounded-lg bg-[#080A10] border border-white/15 text-white font-bold"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-300 mb-1">Цувралын төлөв</label>
+                        <select
+                          value={formData.seriesStatus}
+                          onChange={(e) => setFormData({ ...formData, seriesStatus: e.target.value as any })}
+                          className="w-full px-3 py-2 rounded-lg bg-[#080A10] border border-white/15 text-white font-bold"
+                        >
+                          <option value="completed">Дууссан (Completed)</option>
+                          <option value="ongoing">Гарч байгаа (Ongoing)</option>
+                        </select>
+                      </div>
+                    </div>
                   </div>
+                )}
 
-                  {/* 18, 19, 20. Checkboxes */}
-                  <div className="flex flex-col justify-center space-y-2 pt-2">
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={formData.featured}
-                        onChange={(e) => setFormData({ ...formData, featured: e.target.checked })}
-                        className="rounded text-[#e50914]"
-                      />
-                      <span className="text-white font-bold">Онцлох кино (Featured)</span>
-                    </label>
+                {/* Badges & Platform Visibility Checkboxes */}
+                <div className="p-4 rounded-xl bg-white/5 border border-white/10 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.hasMongolianSubtitles}
+                      onChange={(e) => setFormData({ ...formData, hasMongolianSubtitles: e.target.checked })}
+                      className="rounded text-[#1764F5]"
+                    />
+                    <span className="text-white font-bold">🇲🇳 Монгол хадмалтай</span>
+                  </label>
 
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={formData.isPremium}
-                        onChange={(e) => setFormData({ ...formData, isPremium: e.target.checked })}
-                        className="rounded text-[#e50914]"
-                      />
-                      <span className="text-white font-bold">Төлбөртэй (Premium)</span>
-                    </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.isOriginal}
+                      onChange={(e) => setFormData({ ...formData, isOriginal: e.target.checked })}
+                      className="rounded text-[#1764F5]"
+                    />
+                    <span className="text-[#347DFF] font-bold">• AI MOVIE Original</span>
+                  </label>
 
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={formData.published}
-                        onChange={(e) => setFormData({ ...formData, published: e.target.checked })}
-                        className="rounded text-emerald-500"
-                      />
-                      <span className="text-emerald-400 font-bold">Нийтлэх (Published)</span>
-                    </label>
-                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.isExclusive}
+                      onChange={(e) => setFormData({ ...formData, isExclusive: e.target.checked })}
+                      className="rounded text-rose-500"
+                    />
+                    <span className="text-rose-400 font-bold">EXCLUSIVE шошго</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.isShortDrama}
+                      onChange={(e) => setFormData({ ...formData, isShortDrama: e.target.checked })}
+                      className="rounded text-[#E8B94F]"
+                    />
+                    <span className="text-[#E8B94F] font-bold">Богино драм (Short Drama)</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.featured}
+                      onChange={(e) => setFormData({ ...formData, featured: e.target.checked })}
+                      className="rounded text-[#e50914]"
+                    />
+                    <span className="text-white font-bold">Онцлох (Hero Banner)</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.isPremium}
+                      onChange={(e) => setFormData({ ...formData, isPremium: e.target.checked })}
+                      className="rounded text-[#e50914]"
+                    />
+                    <span className="text-white font-bold">Төлбөртэй (Premium)</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.vipEnabled}
+                      onChange={(e) => setFormData({ ...formData, vipEnabled: e.target.checked })}
+                      className="rounded text-[#E8B94F]"
+                    />
+                    <span className="text-[#E8B94F] font-bold">VIP багцаар үзэх боломжтой</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={formData.published}
+                      onChange={(e) => setFormData({ ...formData, published: e.target.checked })}
+                      className="rounded text-emerald-500"
+                    />
+                    <span className="text-emerald-400 font-bold">Нийтлэх (Published)</span>
+                  </label>
                 </div>
 
                 {/* Submit button */}
@@ -2683,6 +2994,176 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                 className="py-2 rounded-xl bg-gradient-to-r from-[#e50914] to-rose-700 text-white font-black text-xs shadow-md cursor-pointer"
               >
                 Хадгалах
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Episode Manager Modal for TV Series */}
+      {episodeManagerMovie && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-5xl max-h-[90vh] bg-[#0B0E17] border border-[#252A36] rounded-2xl flex flex-col shadow-2xl overflow-hidden text-xs">
+            {/* Header */}
+            <div className="p-5 border-b border-[#252A36] flex flex-wrap items-center justify-between gap-4 bg-[#10131D]">
+              <div>
+                <h3 className="text-base font-black text-white flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-[#347DFF]" />
+                  <span>Ангиуд удирдах: {episodeManagerMovie.titleMn || episodeManagerMovie.title?.mn}</span>
+                </h3>
+                <p className="text-[11px] text-[#9CA3AF] mt-0.5">
+                  Нийт {episodeManagerMovie.totalEpisodes || episodesList.length} анги · Эхний {episodeManagerMovie.freeEpisodes ?? 6} анги үнэгүй · Cloudflare R2 MP4 видео болон хадмал тохируулах
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleAutoGenerateEpisodesInEditor}
+                  className="px-3.5 py-2 rounded-xl bg-[#1764F5]/20 hover:bg-[#1764F5]/30 border border-[#1764F5]/40 text-[#347DFF] font-bold cursor-pointer"
+                >
+                  ⚡ 1–{episodeManagerMovie.totalEpisodes || 50} анги автоматаар үүсгэх
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEpisodeManagerMovie(null)}
+                  className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Range Selector Bar */}
+            <div className="px-5 py-3 border-b border-[#252A36] bg-[#080A10] flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                {Array.from({ length: Math.ceil(Math.max(1, episodesList.length) / 25) }).map((_, idx) => {
+                  const start = idx * 25 + 1;
+                  const end = Math.min(episodesList.length, (idx + 1) * 25);
+                  return (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => setEpisodePageIdx(idx)}
+                      className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer ${
+                        episodePageIdx === idx
+                          ? 'bg-[#1764F5] text-white'
+                          : 'bg-[#11141D] text-[#9CA3AF] hover:text-white border border-[#252A36]'
+                      }`}
+                    >
+                      {start}–{end}-р анги
+                    </button>
+                  );
+                })}
+              </div>
+              <span className="text-[11px] text-[#9CA3AF]">
+                Нийт <strong className="text-white">{episodesList.length}</strong> анги бүртгэлтэй
+              </span>
+            </div>
+
+            {/* Episodes Table */}
+            <div className="flex-1 overflow-y-auto p-5 space-y-2.5">
+              {episodesLoading ? (
+                <div className="py-16 text-center text-slate-400">Ангиудын мэдээлэл ачаалж байна...</div>
+              ) : (
+                episodesList.slice(episodePageIdx * 25, (episodePageIdx + 1) * 25).map((ep) => (
+                  <div
+                    key={ep.episodeNumber}
+                    className="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center p-3 rounded-xl bg-[#11141D] border border-[#252A36]"
+                  >
+                    <div className="md:col-span-1 font-black text-white flex items-center gap-1.5">
+                      <span className="w-7 h-7 rounded-lg bg-[#1764F5]/20 border border-[#1764F5]/40 text-[#347DFF] flex items-center justify-center">
+                        {ep.episodeNumber}
+                      </span>
+                    </div>
+                    <div className="md:col-span-3">
+                      <input
+                        type="text"
+                        value={ep.title}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setEpisodesList((prev) =>
+                            prev.map((item) =>
+                              item.episodeNumber === ep.episodeNumber ? { ...item, title: val } : item
+                            )
+                          );
+                        }}
+                        placeholder={`${ep.episodeNumber}-р анги`}
+                        className="w-full px-2.5 py-1.5 rounded-lg bg-[#080A10] border border-[#252A36] text-white"
+                      />
+                    </div>
+                    <div className="md:col-span-2">
+                      <input
+                        type="text"
+                        value={ep.duration}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setEpisodesList((prev) =>
+                            prev.map((item) =>
+                              item.episodeNumber === ep.episodeNumber ? { ...item, duration: val } : item
+                            )
+                          );
+                        }}
+                        placeholder="2 мин"
+                        className="w-full px-2.5 py-1.5 rounded-lg bg-[#080A10] border border-[#252A36] text-white"
+                      />
+                    </div>
+                    <div className="md:col-span-4">
+                      <input
+                        type="url"
+                        value={ep.videoUrl}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setEpisodesList((prev) =>
+                            prev.map((item) =>
+                              item.episodeNumber === ep.episodeNumber ? { ...item, videoUrl: val } : item
+                            )
+                          );
+                        }}
+                        placeholder="https://... (Cloudflare R2 MP4 URL)"
+                        className="w-full px-2.5 py-1.5 rounded-lg bg-[#080A10] border border-[#252A36] text-white font-mono text-[11px]"
+                      />
+                    </div>
+                    <div className="md:col-span-2 flex items-center justify-end gap-2">
+                      <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={ep.isFree}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setEpisodesList((prev) =>
+                              prev.map((item) =>
+                                item.episodeNumber === ep.episodeNumber ? { ...item, isFree: checked } : item
+                              )
+                            );
+                          }}
+                          className="rounded text-emerald-500"
+                        />
+                        <span className={ep.isFree ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
+                          {ep.isFree ? 'Үнэгүй' : 'Түгжээтэй'}
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 border-t border-[#252A36] bg-[#10131D] flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setEpisodeManagerMovie(null)}
+                className="px-4 py-2 rounded-xl bg-white/10 text-white font-bold cursor-pointer"
+              >
+                Болих
+              </button>
+              <button
+                type="button"
+                disabled={episodesSaving}
+                onClick={handleSaveBulkEpisodes}
+                className="px-5 py-2 rounded-xl bg-[#1764F5] hover:bg-[#347DFF] text-white font-black cursor-pointer disabled:opacity-50"
+              >
+                {episodesSaving ? 'Хадгалж байна...' : 'Бүх ангийг хадгалах'}
               </button>
             </div>
           </div>

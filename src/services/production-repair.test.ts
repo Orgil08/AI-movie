@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Storage, memDb } from '../db/storage.js';
+import {
+  Storage,
+  memDb,
+  DatabaseConnectionError,
+  enableStrictMongoMode,
+  ensureDatabaseConnection,
+  getDatabaseStatus,
+  normalizeStorageError,
+  requireDatabaseConnection,
+  requireMongoInProduction
+} from '../db/storage.js';
 import { checkMovieAccess, isMovieLockedForSubscription, getPlanRank } from '../utils/accessControl.js';
 
 test('Phase 1 — Movie creation maps synopsisMn and synopsisEn and prevents duplicate slugs', async () => {
@@ -62,6 +72,83 @@ test('Phase 1 — Movie creation maps synopsisMn and synopsisEn and prevents dup
   );
 });
 
+test('Phase 1 — Production & Server MongoDB fail-closed: returns HTTP 503 instead of falling back to memory storage', async () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalMongoUri = process.env.MONGODB_URI;
+
+  try {
+    // 1. Missing MONGODB_URI in production must throw DatabaseConnectionError (503 DATABASE_NOT_CONFIGURED)
+    process.env.NODE_ENV = 'production';
+    delete process.env.MONGODB_URI;
+
+    await assert.rejects(
+      async () => {
+        await Storage.getAllMovies();
+      },
+      (err: any) =>
+        err instanceof DatabaseConnectionError &&
+        err.statusCode === 503 &&
+        err.code === 'DATABASE_NOT_CONFIGURED'
+    );
+
+    // 2. Server strict MongoDB mode in development also throws 503 instead of using memory fallback
+    process.env.NODE_ENV = 'development';
+    enableStrictMongoMode(true);
+    await assert.rejects(
+      async () => {
+        await ensureDatabaseConnection();
+      },
+      (err: any) =>
+        err instanceof DatabaseConnectionError &&
+        err.statusCode === 503 &&
+        err.code === 'DATABASE_NOT_CONFIGURED'
+    );
+
+    // 3. Unconnected MongoDB with configured URI must throw 503 DATABASE_UNAVAILABLE in all environments
+    process.env.MONGODB_URI = 'mongodb://127.0.0.1:27999/nonexistent';
+    assert.throws(
+      () => {
+        requireDatabaseConnection(false);
+      },
+      (err: any) =>
+        err instanceof DatabaseConnectionError &&
+        err.statusCode === 503 &&
+        err.code === 'DATABASE_UNAVAILABLE'
+    );
+    assert.throws(
+      () => {
+        requireMongoInProduction(false);
+      },
+      (err: any) =>
+        err instanceof DatabaseConnectionError &&
+        err.statusCode === 503 &&
+        err.code === 'DATABASE_UNAVAILABLE'
+    );
+
+    // 4. Runtime Mongoose topology / network errors normalize to 503 DatabaseConnectionError
+    const networkErr = new Error('connect ECONNREFUSED 127.0.0.1:27017');
+    networkErr.name = 'MongoServerSelectionError';
+    const normalized = normalizeStorageError(networkErr) as DatabaseConnectionError;
+    assert.ok(normalized instanceof DatabaseConnectionError);
+    assert.equal(normalized.statusCode, 503);
+    assert.equal(normalized.code, 'DATABASE_UNAVAILABLE');
+
+    process.env.NODE_ENV = 'production';
+    const status = getDatabaseStatus();
+    assert.equal(status.isProduction, true);
+    assert.equal(status.connected, false);
+    assert.equal(status.mode, 'unavailable');
+  } finally {
+    enableStrictMongoMode(false);
+    process.env.NODE_ENV = originalNodeEnv;
+    if (originalMongoUri !== undefined) {
+      process.env.MONGODB_URI = originalMongoUri;
+    } else {
+      delete process.env.MONGODB_URI;
+    }
+  }
+});
+
 test('Phase 3 — Bank transfer security: user confirmation sets PENDING_REVIEW and only admin approval activates subscription', async () => {
   memDb.clear();
 
@@ -85,13 +172,31 @@ test('Phase 3 — Bank transfer security: user confirmation sets PENDING_REVIEW 
     status: 'PENDING'
   });
 
+  // Another user cannot submit confirmation for Batbayar's order
+  await assert.rejects(
+    async () => {
+      await Storage.submitBankTransferForReview({
+        orderNumber: order.orderNumber,
+        userId: 'intruder-user-id',
+        senderName: 'Intruder',
+        transferRef: 'FAKE-REF'
+      });
+    },
+    (err: any) => err.code === 'UNAUTHORIZED_ACCESS' && err.statusCode === 403
+  );
+
   // User submits transfer confirmation -> status becomes PENDING_REVIEW (never PAID)
-  const pendingReviewOrder = await Storage.updatePaymentStatus(order.orderNumber, 'PENDING_REVIEW', {
-    bankSenderName: 'Batbayar',
-    bankTransferRef: 'KHAN-REF-7788'
+  const pendingReviewOrder = await Storage.submitBankTransferForReview({
+    orderNumber: order.orderNumber,
+    userId: user.id,
+    senderName: 'Batbayar',
+    phone: '99112233',
+    transferRef: 'KHAN-REF-7788'
   });
 
-  assert.equal(pendingReviewOrder?.status, 'PENDING_REVIEW');
+  assert.equal(pendingReviewOrder.status, 'PENDING_REVIEW');
+  assert.equal(pendingReviewOrder.bankSenderName, 'Batbayar (99112233)');
+  assert.equal(pendingReviewOrder.bankTransferRef, 'KHAN-REF-7788');
   const subBeforeAdmin = await Storage.getActiveSubscription(user.id);
   assert.equal(subBeforeAdmin, null, 'User must NOT receive an active subscription before admin approval');
 
@@ -107,6 +212,18 @@ test('Phase 3 — Bank transfer security: user confirmation sets PENDING_REVIEW 
   assert.ok(approval.subscription);
   assert.equal(approval.subscription.planId, 'premium');
   assert.equal(approval.subscription.status, 'ACTIVE');
+
+  // Duplicate approval of an already PAID order must be rejected (409 ORDER_ALREADY_PAID)
+  await assert.rejects(
+    async () => {
+      await Storage.approveBankTransferPayment({
+        idOrOrderNumber: order.orderNumber,
+        adminId: 'admin-1',
+        adminEmail: 'admin@aimovie.mn'
+      });
+    },
+    (err: any) => err.code === 'ORDER_ALREADY_PAID' && err.statusCode === 409
+  );
 
   // Audit log created
   const logs = await Storage.getAuditLogs();

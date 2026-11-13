@@ -87,12 +87,6 @@ export function detectBrowserLocale(): Locale {
 
     const saved = localStorage.getItem('ai_movie_locale');
     if (saved === 'mn' || saved === 'en') return saved as Locale;
-
-    if (typeof navigator !== 'undefined' && navigator.language) {
-      const lang = navigator.language.toLowerCase();
-      if (lang.startsWith('en')) return 'en';
-      if (lang.startsWith('mn')) return 'mn';
-    }
   } catch (e) {
     // Ignore access errors in SSR/sandboxes
   }

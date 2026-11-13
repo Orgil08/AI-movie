@@ -6,10 +6,15 @@ import {
   saveWatchProgress,
   removeWatchProgress,
   clearAllWatchProgress,
+  getWatchHistoryList,
+  recordFinishedMovie,
+  removeWatchHistoryItem,
+  clearWatchHistory,
   formatRemainingTime,
   formatTimestamp,
   WATCH_PROGRESS_STORAGE_KEY,
-  DEFAULT_MOCK_WATCH_PROGRESS
+  DEFAULT_MOCK_WATCH_PROGRESS,
+  DEFAULT_MOCK_WATCH_HISTORY
 } from './watchProgress.js';
 
 class MockStorage implements Storage {
@@ -96,7 +101,7 @@ test('watchProgress - updating progress bumps movie to the top without duplicate
   assert.equal(list.length, 2);
 });
 
-test('watchProgress - removes movie if completion percentage >= 96%', () => {
+test('watchProgress - removes movie if completion percentage >= 96% and records in watch history', () => {
   const storage = new MockStorage();
   saveWatchProgress({ movieId: 'm1', currentTime: 500, duration: 1000 }, storage);
   assert.equal(getWatchProgressList(storage, false).length, 1);
@@ -105,6 +110,44 @@ test('watchProgress - removes movie if completion percentage >= 96%', () => {
   const updated = saveWatchProgress({ movieId: 'm1', currentTime: 980, duration: 1000 }, storage);
   assert.equal(updated.length, 0);
   assert.equal(getWatchProgressForMovie('m1', storage), null);
+
+  // Should now appear in Watch History
+  const history = getWatchHistoryList(storage, false);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].movieId, 'm1');
+  assert.equal(history[0].duration, 1000);
+});
+
+test('watchHistory - records finished movies and sorts strictly by finishedAt descending', () => {
+  const storage = new MockStorage();
+  recordFinishedMovie({ movieId: 'movie-old', duration: 5000, finishedAt: 1000 }, storage);
+  recordFinishedMovie({ movieId: 'movie-newest', duration: 6000, finishedAt: 3000 }, storage);
+  recordFinishedMovie({ movieId: 'movie-middle', duration: 5400, finishedAt: 2000 }, storage);
+
+  const history = getWatchHistoryList(storage, false);
+  assert.equal(history.length, 3);
+  assert.equal(history[0].movieId, 'movie-newest');
+  assert.equal(history[1].movieId, 'movie-middle');
+  assert.equal(history[2].movieId, 'movie-old');
+
+  // Re-finishing movie-old at a later timestamp bumps it to the top without duplicates
+  recordFinishedMovie({ movieId: 'movie-old', duration: 5000, finishedAt: 5000 }, storage);
+  const updated = getWatchHistoryList(storage, false);
+  assert.equal(updated.length, 3);
+  assert.equal(updated[0].movieId, 'movie-old');
+  assert.equal(updated[0].finishedAt, 5000);
+});
+
+test('watchHistory - initializes default mock history and supports remove and clear', () => {
+  const storage = new MockStorage();
+  const initial = getWatchHistoryList(storage, true);
+  assert.equal(initial.length, DEFAULT_MOCK_WATCH_HISTORY.length);
+
+  const afterRemove = removeWatchHistoryItem(initial[0].movieId, storage);
+  assert.equal(afterRemove.length, DEFAULT_MOCK_WATCH_HISTORY.length - 1);
+
+  clearWatchHistory(storage);
+  assert.deepEqual(getWatchHistoryList(storage, false), []);
 });
 
 test('watchProgress - removes specific movie manually', () => {

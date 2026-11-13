@@ -8,8 +8,16 @@ export interface WatchProgress {
   updatedAt: number; // timestamp ms
 }
 
+export interface WatchHistoryItem {
+  movieId: string;
+  duration: number; // in seconds
+  finishedAt: number; // timestamp ms when finished
+}
+
 export const WATCH_PROGRESS_STORAGE_KEY = 'sodon_continue_watching';
+export const WATCH_HISTORY_STORAGE_KEY = 'sodon_watch_history';
 export const MAX_CONTINUE_WATCHING = 8;
+export const MAX_WATCH_HISTORY = 50;
 
 function getSafeStorage(customStorage?: Storage): Storage | null {
   if (customStorage) return customStorage;
@@ -47,6 +55,27 @@ export const DEFAULT_MOCK_WATCH_PROGRESS: WatchProgress[] = [
     duration: 2700,
     percentage: 30,
     updatedAt: Date.now() - 1000 * 60 * 60 * 24 // 1 day ago
+  }
+];
+
+/**
+ * Default sample finished watch history entries sorted by completion date descending.
+ */
+export const DEFAULT_MOCK_WATCH_HISTORY: WatchHistoryItem[] = [
+  {
+    movieId: 'quantum-shaman',
+    duration: 8520,
+    finishedAt: Date.now() - 1000 * 60 * 60 * 5 // 5 hours ago
+  },
+  {
+    movieId: 'ulaanbaatar-neon',
+    duration: 7500,
+    finishedAt: Date.now() - 1000 * 60 * 60 * 28 // 1 day 4 hours ago
+  },
+  {
+    movieId: 'free-pilot-ai-origins',
+    duration: 2700,
+    finishedAt: Date.now() - 1000 * 60 * 60 * 72 // 3 days ago
   }
 ];
 
@@ -127,8 +156,15 @@ export function saveWatchProgress(
   const currentTime = Math.max(0, Math.min(entry.currentTime, entry.duration));
   const percentage = Math.min(100, Math.max(0, Math.round((currentTime / entry.duration) * 100)));
 
-  // If movie is essentially completed (> 96%), remove from continue watching
+  // If movie is essentially completed (>= 96%), record in Watch History and remove from Continue Watching
   if (percentage >= 96) {
+    recordFinishedMovie(
+      {
+        movieId: entry.movieId,
+        duration: entry.duration
+      },
+      storage
+    );
     return removeWatchProgress(entry.movieId, storage);
   }
 
@@ -185,6 +221,125 @@ export function clearAllWatchProgress(storage?: Storage): void {
   if (s) {
     try {
       s.removeItem(WATCH_PROGRESS_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
+  }
+}
+
+/**
+ * Get all finished movies in Watch History, sorted by finishedAt date descending.
+ */
+export function getWatchHistoryList(
+  storage?: Storage,
+  initializeIfEmpty: boolean = true
+): WatchHistoryItem[] {
+  const s = getSafeStorage(storage);
+  if (!s) {
+    return initializeIfEmpty ? [...DEFAULT_MOCK_WATCH_HISTORY].sort((a, b) => b.finishedAt - a.finishedAt) : [];
+  }
+
+  try {
+    const raw = s.getItem(WATCH_HISTORY_STORAGE_KEY);
+    if (!raw) {
+      if (initializeIfEmpty) {
+        const initial = [...DEFAULT_MOCK_WATCH_HISTORY].sort((a, b) => b.finishedAt - a.finishedAt);
+        s.setItem(WATCH_HISTORY_STORAGE_KEY, JSON.stringify(initial));
+        return initial;
+      }
+      return [];
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    const validItems: WatchHistoryItem[] = parsed
+      .filter((item): item is WatchHistoryItem => {
+        return (
+          item &&
+          typeof item.movieId === 'string' &&
+          item.movieId.trim().length > 0 &&
+          typeof item.finishedAt === 'number'
+        );
+      })
+      .map((item) => ({
+        movieId: item.movieId,
+        duration: typeof item.duration === 'number' && item.duration > 0 ? item.duration : 7200,
+        finishedAt: item.finishedAt
+      }))
+      .sort((a, b) => b.finishedAt - a.finishedAt);
+
+    return validItems.slice(0, MAX_WATCH_HISTORY);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Record a movie as finished watching, sorted by completion date (finishedAt descending).
+ */
+export function recordFinishedMovie(
+  entry: { movieId: string; duration?: number; finishedAt?: number },
+  storage?: Storage
+): WatchHistoryItem[] {
+  if (!entry.movieId) {
+    return getWatchHistoryList(storage, false);
+  }
+
+  const list = getWatchHistoryList(storage, false);
+  const newItem: WatchHistoryItem = {
+    movieId: entry.movieId,
+    duration: entry.duration && entry.duration > 0 ? entry.duration : 7200,
+    finishedAt: entry.finishedAt ?? Date.now()
+  };
+
+  const filtered = list.filter((item) => item.movieId !== entry.movieId);
+  const updatedList = [newItem, ...filtered]
+    .sort((a, b) => b.finishedAt - a.finishedAt)
+    .slice(0, MAX_WATCH_HISTORY);
+
+  const s = getSafeStorage(storage);
+  if (s) {
+    try {
+      s.setItem(WATCH_HISTORY_STORAGE_KEY, JSON.stringify(updatedList));
+    } catch {
+      // Ignore quota errors
+    }
+  }
+
+  return updatedList;
+}
+
+/**
+ * Remove a single movie from Watch History.
+ */
+export function removeWatchHistoryItem(
+  movieId: string,
+  storage?: Storage
+): WatchHistoryItem[] {
+  const list = getWatchHistoryList(storage, false);
+  const updatedList = list.filter((item) => item.movieId !== movieId);
+
+  const s = getSafeStorage(storage);
+  if (s) {
+    try {
+      s.setItem(WATCH_HISTORY_STORAGE_KEY, JSON.stringify(updatedList));
+    } catch {
+      // Ignore
+    }
+  }
+
+  return updatedList;
+}
+
+/**
+ * Clear all Watch History records.
+ */
+export function clearWatchHistory(storage?: Storage): void {
+  const s = getSafeStorage(storage);
+  if (s) {
+    try {
+      s.setItem(WATCH_HISTORY_STORAGE_KEY, JSON.stringify([]));
     } catch {
       // Ignore
     }
